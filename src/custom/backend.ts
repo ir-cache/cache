@@ -21,9 +21,17 @@ const versionSalt = "1.0";
 const httpClient = new HttpClient("ir-cache-action");
 
 function getBaseUrl(): string {
-  const url = process.env.IR_CACHE_URL;
+  let url = process.env.IR_CACHE_URL;
   if (!url) {
-    throw new Error("IR_CACHE_URL environment variable is not set");
+    // Fallback: read from file written by IR's cloud-init/entrypoint
+    try {
+      url = fs.readFileSync("/etc/ir/cache-url", "utf-8").trim();
+    } catch {
+      // file doesn't exist
+    }
+  }
+  if (!url) {
+    throw new Error("IR_CACHE_URL not set and /etc/ir/cache-url not found");
   }
   return url.replace(/\/+$/, "");
 }

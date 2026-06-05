@@ -1,11 +1,22 @@
 import * as cache from "@actions/cache";
 import * as core from "@actions/core";
+import * as fs from "fs";
 import { Inputs, Outputs, State } from "./constants";
 import * as custom from "./custom/cache";
 import { IStateProvider, NullStateProvider, StateProvider } from "./stateProvider";
 import * as utils from "./utils/actionUtils";
 
-const useIRCache = !!process.env.IR_CACHE_URL;
+function detectIRCache(): boolean {
+  if (process.env.IR_CACHE_URL) return true;
+  try {
+    const url = fs.readFileSync("/etc/ir/cache-url", "utf-8").trim();
+    return !!url;
+  } catch {
+    return false;
+  }
+}
+
+const useIRCache = detectIRCache();
 
 export async function restoreImpl(
   stateProvider: IStateProvider,
