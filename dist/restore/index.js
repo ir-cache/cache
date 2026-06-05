@@ -97935,9 +97935,6 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.getAuthHeaders = getAuthHeaders;
 exports.getCacheVersion = getCacheVersion;
 exports.getCacheEntry = getCacheEntry;
-exports.reserveCache = reserveCache;
-exports.uploadChunks = uploadChunks;
-exports.commitCache = commitCache;
 exports.saveCache = saveCache;
 exports.downloadCache = downloadCache;
 const crypto = __importStar(__nccwpck_require__(76982));
@@ -97945,11 +97942,11 @@ const fs = __importStar(__nccwpck_require__(79896));
 const core = __importStar(__nccwpck_require__(37484));
 const http_client_1 = __nccwpck_require__(54844);
 const versionSalt = "1.0";
+const twirpPrefix = "/twirp/github.actions.results.api.v1.CacheService/";
 const httpClient = new http_client_1.HttpClient("ir-cache-action");
 function getBaseUrl() {
     let url = process.env.IR_CACHE_URL;
     if (!url) {
-        // Fallback: read from file written by IR's cloud-init/entrypoint
         try {
             url = fs.readFileSync("/etc/ir/cache-url", "utf-8").trim();
         }
@@ -97990,93 +97987,127 @@ function getCacheVersion(paths, compressionMethod, enableCrossOsArchive = false)
 async function getCacheEntry(keys, paths, options) {
     const baseUrl = getBaseUrl();
     const version = getCacheVersion(paths, options.compressionMethod, options.enableCrossOsArchive);
-    const keysParam = keys.join(",");
-    const url = `${baseUrl}/cache/_apis/artifactcache/cache?keys=${encodeURIComponent(keysParam)}&version=${encodeURIComponent(version)}`;
-    const headers = getAuthHeaders();
-    const response = await httpClient.getJson(url, headers);
-    if (response.statusCode === 204 || !response.result?.archiveLocation) {
+    const url = `${baseUrl}${twirpPrefix}GetCacheEntryDownloadURL`;
+    const headers = {
+        ...getAuthHeaders(),
+        "Content-Type": "application/json",
+    };
+    const primaryKey = keys[0];
+    const restoreKeys = keys.slice(1);
+    const body = JSON.stringify({
+        key: primaryKey,
+        restoreKeys,
+        version,
+    });
+    const response = await httpClient.post(url, body, headers);
+    const statusCode = response.message.statusCode || 0;
+    const responseBody = await response.readBody();
+    if (statusCode !== 200) {
+        core.debug(`GetCacheEntryDownloadURL returned ${statusCode}: ${responseBody}`);
+        return null;
+    }
+    const result = JSON.parse(responseBody);
+    if (!result.ok || !result.signedDownloadUrl) {
         return null;
     }
     return {
-        cacheKey: response.result.cacheKey,
-        archiveLocation: response.result.archiveLocation,
+        cacheKey: result.matchedKey || primaryKey,
+        archiveLocation: result.signedDownloadUrl,
     };
-}
-async function reserveCache(key, paths, options) {
-    const baseUrl = getBaseUrl();
-    const version = getCacheVersion(paths, options.compressionMethod, options.enableCrossOsArchive);
-    const url = `${baseUrl}/cache/_apis/artifactcache/caches`;
-    const headers = {
-        ...getAuthHeaders(),
-        "Content-Type": "application/json",
-    };
-    const body = JSON.stringify({ key, version });
-    const response = await httpClient.post(url, body, headers);
-    const statusCode = response.message.statusCode || 0;
-    if (statusCode === 409) {
-        core.info(`Cache entry already exists for key: ${key}`);
-        return -1;
-    }
-    const responseBody = await response.readBody();
-    const result = JSON.parse(responseBody);
-    if (statusCode !== 201 || !result?.cacheId) {
-        throw new Error(`Reserve cache failed with status ${statusCode}`);
-    }
-    return result.cacheId;
-}
-async function uploadChunks(cacheId, archivePath, chunkSize) {
-    const baseUrl = getBaseUrl();
-    const url = `${baseUrl}/cache/_apis/artifactcache/caches/${cacheId}`;
-    const fileSize = fs.statSync(archivePath).size;
-    let offset = 0;
-    let partNum = 1;
-    const totalParts = Math.ceil(fileSize / chunkSize);
-    while (offset < fileSize) {
-        const chunkEnd = Math.min(offset + chunkSize, fileSize);
-        const stream = fs.createReadStream(archivePath, {
-            start: offset,
-            end: chunkEnd - 1,
-        });
-        const headers = {
-            ...getAuthHeaders(),
-            "Content-Type": "application/octet-stream",
-            "Content-Range": `bytes ${offset}-${chunkEnd - 1}/*`,
-        };
-        const response = await httpClient.sendStream("PATCH", url, stream, headers);
-        const statusCode = response.message.statusCode || 0;
-        if (statusCode !== 204 && statusCode !== 200) {
-            throw new Error(`Upload chunk failed: status ${statusCode}`);
-        }
-        core.info(`Uploaded part ${partNum}/${totalParts}`);
-        offset = chunkEnd;
-        partNum++;
-    }
-}
-async function commitCache(cacheId, size) {
-    const baseUrl = getBaseUrl();
-    const url = `${baseUrl}/cache/_apis/artifactcache/caches/${cacheId}`;
-    const headers = {
-        ...getAuthHeaders(),
-        "Content-Type": "application/json",
-    };
-    const body = JSON.stringify({ size });
-    const response = await httpClient.post(url, body, headers);
-    const statusCode = response.message.statusCode || 0;
-    if (statusCode !== 200 && statusCode !== 204) {
-        throw new Error(`Commit cache failed with status ${statusCode}`);
-    }
 }
 async function saveCache(key, paths, archivePath, options) {
-    const chunkSize = options.chunkSize || 32 * 1024 * 1024;
+    const baseUrl = getBaseUrl();
+    const version = getCacheVersion(paths, options.compressionMethod, options.enableCrossOsArchive);
     const fileSize = fs.statSync(archivePath).size;
     core.info(`Cache Size: ~${Math.round(fileSize / (1024 * 1024))} MB (${fileSize} B)`);
-    const cacheId = await reserveCache(key, paths, options);
-    if (cacheId === -1) {
+    // Step 1: CreateCacheEntry — get presigned upload URL(s)
+    const createUrl = `${baseUrl}${twirpPrefix}CreateCacheEntry`;
+    const createHeaders = {
+        ...getAuthHeaders(),
+        "Content-Type": "application/json",
+    };
+    const createBody = JSON.stringify({
+        key,
+        version,
+        sizeBytes: String(fileSize),
+    });
+    const createResponse = await httpClient.post(createUrl, createBody, createHeaders);
+    const createStatus = createResponse.message.statusCode || 0;
+    const createResponseBody = await createResponse.readBody();
+    if (createStatus !== 200) {
+        throw new Error(`CreateCacheEntry failed with status ${createStatus}: ${createResponseBody}`);
+    }
+    const createResult = JSON.parse(createResponseBody);
+    if (!createResult.ok) {
+        core.info("Cache entry already exists (immutable) — skipping save");
         return;
     }
-    core.info(`Reserved cache with ID: ${cacheId}`);
-    await uploadChunks(cacheId, archivePath, chunkSize);
-    await commitCache(cacheId, fileSize);
+    // Step 2: Upload to S3 via presigned URL(s)
+    if (createResult.multipart) {
+        // Multipart upload
+        const { uploadId, parts, partSize } = createResult.multipart;
+        core.info(`Multipart upload: ${parts.length} parts, ${Math.round(partSize / (1024 * 1024))}MB each`);
+        const completedParts = [];
+        for (const part of parts) {
+            const start = (part.partNumber - 1) * partSize;
+            const end = Math.min(start + partSize, fileSize);
+            const stream = fs.createReadStream(archivePath, { start, end: end - 1 });
+            const putResponse = await httpClient.sendStream("PUT", part.url, stream, {
+                "Content-Length": String(end - start),
+            });
+            const putStatus = putResponse.message.statusCode || 0;
+            if (putStatus !== 200) {
+                throw new Error(`Multipart upload part ${part.partNumber} failed: status ${putStatus}`);
+            }
+            const etag = putResponse.message.headers["etag"] || "";
+            completedParts.push({ partNumber: part.partNumber, etag });
+            core.info(`Uploaded part ${part.partNumber}/${parts.length}`);
+        }
+        // Step 3: Finalize with completed parts
+        const finalizeUrl = `${baseUrl}${twirpPrefix}FinalizeCacheEntryUpload`;
+        const finalizeBody = JSON.stringify({
+            key,
+            version,
+            sizeBytes: String(fileSize),
+            uploadId,
+            parts: completedParts,
+        });
+        const finalizeResponse = await httpClient.post(finalizeUrl, finalizeBody, createHeaders);
+        const finalizeStatus = finalizeResponse.message.statusCode || 0;
+        if (finalizeStatus !== 200) {
+            const finalizeResponseBody = await finalizeResponse.readBody();
+            throw new Error(`FinalizeCacheEntryUpload failed: ${finalizeStatus} ${finalizeResponseBody}`);
+        }
+    }
+    else if (createResult.signedUploadUrl) {
+        // Single PUT upload
+        const stream = fs.createReadStream(archivePath);
+        const putResponse = await httpClient.sendStream("PUT", createResult.signedUploadUrl, stream, {
+            "Content-Length": String(fileSize),
+            "Content-Type": "application/octet-stream",
+        });
+        const putStatus = putResponse.message.statusCode || 0;
+        if (putStatus !== 200) {
+            throw new Error(`S3 upload failed: status ${putStatus}`);
+        }
+        core.info("Upload complete, finalizing...");
+        // Step 3: Finalize
+        const finalizeUrl = `${baseUrl}${twirpPrefix}FinalizeCacheEntryUpload`;
+        const finalizeBody = JSON.stringify({
+            key,
+            version,
+            sizeBytes: String(fileSize),
+        });
+        const finalizeResponse = await httpClient.post(finalizeUrl, finalizeBody, createHeaders);
+        const finalizeStatus = finalizeResponse.message.statusCode || 0;
+        if (finalizeStatus !== 200) {
+            const finalizeResponseBody = await finalizeResponse.readBody();
+            throw new Error(`FinalizeCacheEntryUpload failed: ${finalizeStatus} ${finalizeResponseBody}`);
+        }
+    }
+    else {
+        throw new Error("CreateCacheEntry returned ok=true but no upload URL");
+    }
     core.info("Cache saved successfully.");
 }
 async function downloadCache(archiveLocation, archivePath) {
