@@ -97947,9 +97947,18 @@ const http_client_1 = __nccwpck_require__(54844);
 const versionSalt = "1.0";
 const httpClient = new http_client_1.HttpClient("ir-cache-action");
 function getBaseUrl() {
-    const url = process.env.IR_CACHE_URL;
+    let url = process.env.IR_CACHE_URL;
     if (!url) {
-        throw new Error("IR_CACHE_URL environment variable is not set");
+        // Fallback: read from file written by IR's cloud-init/entrypoint
+        try {
+            url = fs.readFileSync("/etc/ir/cache-url", "utf-8").trim();
+        }
+        catch {
+            // file doesn't exist
+        }
+    }
+    if (!url) {
+        throw new Error("IR_CACHE_URL not set and /etc/ir/cache-url not found");
     }
     return url.replace(/\/+$/, "");
 }
@@ -98303,11 +98312,23 @@ exports.restoreOnlyRun = restoreOnlyRun;
 exports.restoreRun = restoreRun;
 const cache = __importStar(__nccwpck_require__(5116));
 const core = __importStar(__nccwpck_require__(37484));
+const fs = __importStar(__nccwpck_require__(79896));
 const constants_1 = __nccwpck_require__(27242);
 const custom = __importStar(__nccwpck_require__(70897));
 const stateProvider_1 = __nccwpck_require__(52879);
 const utils = __importStar(__nccwpck_require__(8270));
-const useIRCache = !!process.env.IR_CACHE_URL;
+function detectIRCache() {
+    if (process.env.IR_CACHE_URL)
+        return true;
+    try {
+        const url = fs.readFileSync("/etc/ir/cache-url", "utf-8").trim();
+        return !!url;
+    }
+    catch {
+        return false;
+    }
+}
+const useIRCache = detectIRCache();
 async function restoreImpl(stateProvider, earlyExit) {
     try {
         if (!useIRCache && !utils.isCacheFeatureAvailable()) {
