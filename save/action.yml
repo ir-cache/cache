@@ -1,0 +1,23 @@
+name: 'IR Cache Save'
+description: 'Save cache to IR S3 backend'
+author: 'IRunner'
+inputs:
+  path:
+    description: 'Files, directories, and wildcard patterns to cache'
+    required: true
+  key:
+    description: 'Explicit key for saving the cache'
+    required: true
+  upload-chunk-size:
+    description: 'Chunk size for uploads in bytes'
+    required: false
+  enableCrossOsArchive:
+    description: 'Allow cross-OS cache save'
+    default: 'false'
+    required: false
+runs:
+  using: 'node24'
+  main: '../dist/save-only/index.js'
+branding:
+  icon: 'archive'
+  color: 'gray-dark'
