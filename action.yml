@@ -1,0 +1,43 @@
+name: 'IR Cache'
+description: 'Drop-in actions/cache replacement with S3 backend via IR control plane'
+author: 'IRunner'
+inputs:
+  path:
+    description: 'Files, directories, and wildcard patterns to cache and restore'
+    required: true
+  key:
+    description: 'Explicit key for restoring and saving the cache'
+    required: true
+  restore-keys:
+    description: 'Ordered list of prefix-matched keys for restoring stale cache'
+    required: false
+  upload-chunk-size:
+    description: 'Chunk size for uploads in bytes'
+    required: false
+  enableCrossOsArchive:
+    description: 'Allow cross-OS cache restore'
+    default: 'false'
+    required: false
+  fail-on-cache-miss:
+    description: 'Fail the workflow if cache entry is not found'
+    default: 'false'
+    required: false
+  lookup-only:
+    description: 'Check if cache exists without downloading'
+    default: 'false'
+    required: false
+  save-always:
+    description: 'Save cache even if a previous step failed'
+    default: 'false'
+    required: false
+outputs:
+  cache-hit:
+    description: 'Boolean indicating exact match for the primary key'
+runs:
+  using: 'node24'
+  main: 'dist/restore/index.js'
+  post: 'dist/save/index.js'
+  post-if: "success()"
+branding:
+  icon: 'archive'
+  color: 'gray-dark'

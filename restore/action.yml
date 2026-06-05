@@ -1,0 +1,38 @@
+name: 'IR Cache Restore'
+description: 'Restore cache from IR S3 backend'
+author: 'IRunner'
+inputs:
+  path:
+    description: 'Files, directories, and wildcard patterns to restore'
+    required: true
+  key:
+    description: 'Explicit key for restoring the cache'
+    required: true
+  restore-keys:
+    description: 'Ordered list of prefix-matched keys'
+    required: false
+  enableCrossOsArchive:
+    description: 'Allow cross-OS cache restore'
+    default: 'false'
+    required: false
+  fail-on-cache-miss:
+    description: 'Fail if cache not found'
+    default: 'false'
+    required: false
+  lookup-only:
+    description: 'Check if cache exists without downloading'
+    default: 'false'
+    required: false
+outputs:
+  cache-hit:
+    description: 'Boolean indicating exact match for the primary key'
+  cache-primary-key:
+    description: 'The primary key that was searched'
+  cache-matched-key:
+    description: 'The key of the cache that was restored'
+runs:
+  using: 'node24'
+  main: '../dist/restore-only/index.js'
+branding:
+  icon: 'archive'
+  color: 'gray-dark'
