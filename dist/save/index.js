@@ -97944,6 +97944,9 @@ const http_client_1 = __nccwpck_require__(54844);
 const versionSalt = "1.0";
 const twirpPrefix = "/twirp/github.actions.results.api.v1.CacheService/";
 const httpClient = new http_client_1.HttpClient("ir-cache-action");
+const UPLOAD_CONCURRENCY = Number(process.env.IR_UPLOAD_CONCURRENCY || "4");
+const DOWNLOAD_CONCURRENCY = Number(process.env.IR_DOWNLOAD_CONCURRENCY || "8");
+const DOWNLOAD_PART_SIZE = Number(process.env.IR_DOWNLOAD_PART_SIZE || "16") * 1024 * 1024;
 function getBaseUrl() {
     let url = process.env.IR_CACHE_URL;
     if (!url) {
@@ -98044,11 +98047,11 @@ async function saveCache(key, paths, archivePath, options) {
     }
     // Step 2: Upload to S3 via presigned URL(s)
     if (createResult.multipart) {
-        // Multipart upload
         const { uploadId, parts, partSize } = createResult.multipart;
-        core.info(`Multipart upload: ${parts.length} parts, ${Math.round(partSize / (1024 * 1024))}MB each`);
-        const completedParts = [];
-        for (const part of parts) {
+        core.info(`Multipart upload: ${parts.length} parts, ${Math.round(partSize / (1024 * 1024))}MB each, concurrency ${UPLOAD_CONCURRENCY}`);
+        const completedParts = new Array(parts.length);
+        // Upload parts in parallel with concurrency limit
+        await parallelMap(parts, UPLOAD_CONCURRENCY, async (part) => {
             const start = (part.partNumber - 1) * partSize;
             const end = Math.min(start + partSize, fileSize);
             const stream = fs.createReadStream(archivePath, { start, end: end - 1 });
@@ -98060,9 +98063,9 @@ async function saveCache(key, paths, archivePath, options) {
                 throw new Error(`Multipart upload part ${part.partNumber} failed: status ${putStatus}`);
             }
             const etag = putResponse.message.headers["etag"] || "";
-            completedParts.push({ partNumber: part.partNumber, etag });
+            completedParts[part.partNumber - 1] = { partNumber: part.partNumber, etag };
             core.info(`Uploaded part ${part.partNumber}/${parts.length}`);
-        }
+        });
         // Step 3: Finalize with completed parts
         const finalizeUrl = `${baseUrl}${twirpPrefix}FinalizeCacheEntryUpload`;
         const finalizeBody = JSON.stringify({
@@ -98111,18 +98114,75 @@ async function saveCache(key, paths, archivePath, options) {
     core.info("Cache saved successfully.");
 }
 async function downloadCache(archiveLocation, archivePath) {
-    const response = await httpClient.get(archiveLocation);
-    const statusCode = response.message.statusCode || 0;
-    if (statusCode !== 200) {
-        throw new Error(`Download failed with status ${statusCode}`);
+    // Get content length first via HEAD
+    const headResponse = await httpClient.head(archiveLocation);
+    const contentLength = Number(headResponse.message.headers["content-length"] || "0");
+    if (contentLength === 0 || contentLength < DOWNLOAD_PART_SIZE) {
+        // Small file — single GET
+        const response = await httpClient.get(archiveLocation);
+        const statusCode = response.message.statusCode || 0;
+        if (statusCode !== 200) {
+            throw new Error(`Download failed with status ${statusCode}`);
+        }
+        const fileStream = fs.createWriteStream(archivePath);
+        return new Promise((resolve, reject) => {
+            response.message.pipe(fileStream);
+            response.message.on("error", reject);
+            fileStream.on("finish", resolve);
+            fileStream.on("error", reject);
+        });
     }
-    const fileStream = fs.createWriteStream(archivePath);
-    return new Promise((resolve, reject) => {
-        response.message.pipe(fileStream);
-        response.message.on("error", reject);
-        fileStream.on("finish", resolve);
-        fileStream.on("error", reject);
+    // Large file — parallel range downloads
+    const numParts = Math.ceil(contentLength / DOWNLOAD_PART_SIZE);
+    core.info(`Parallel download: ${numParts} parts, ${Math.round(DOWNLOAD_PART_SIZE / (1024 * 1024))}MB each, concurrency ${DOWNLOAD_CONCURRENCY}`);
+    // Pre-allocate the file
+    const fd = fs.openSync(archivePath, "w");
+    fs.ftruncateSync(fd, contentLength);
+    fs.closeSync(fd);
+    const parts = Array.from({ length: numParts }, (_, i) => i);
+    await parallelMap(parts, DOWNLOAD_CONCURRENCY, async (partIndex) => {
+        const start = partIndex * DOWNLOAD_PART_SIZE;
+        const end = Math.min(start + DOWNLOAD_PART_SIZE - 1, contentLength - 1);
+        const rangeResponse = await httpClient.get(archiveLocation, {
+            Range: `bytes=${start}-${end}`,
+        });
+        const statusCode = rangeResponse.message.statusCode || 0;
+        if (statusCode !== 206 && statusCode !== 200) {
+            throw new Error(`Range download failed: status ${statusCode} for bytes ${start}-${end}`);
+        }
+        const chunks = [];
+        return new Promise((resolve, reject) => {
+            rangeResponse.message.on("data", (chunk) => {
+                chunks.push(chunk);
+            });
+            rangeResponse.message.on("end", () => {
+                const data = Buffer.concat(chunks);
+                const fd = fs.openSync(archivePath, "r+");
+                fs.writeSync(fd, data, 0, data.length, start);
+                fs.closeSync(fd);
+                resolve();
+            });
+            rangeResponse.message.on("error", reject);
+        });
     });
+    const actualSize = fs.statSync(archivePath).size;
+    if (actualSize !== contentLength) {
+        throw new Error(`Download size mismatch: expected ${contentLength}, got ${actualSize}`);
+    }
+}
+// parallelMap executes an async function over items with a concurrency limit.
+async function parallelMap(items, concurrency, fn) {
+    const executing = new Set();
+    for (const item of items) {
+        const p = fn(item).then(() => {
+            executing.delete(p);
+        });
+        executing.add(p);
+        if (executing.size >= concurrency) {
+            await Promise.race(executing);
+        }
+    }
+    await Promise.all(executing);
 }
 
 
