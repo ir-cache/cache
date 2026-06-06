@@ -195,22 +195,13 @@ export async function saveCache(
 
     const completedParts: CompletedPart[] = new Array(parts.length);
 
-    // Upload parts in parallel with concurrency limit
+    // Upload parts in parallel with concurrency limit using native https
     await parallelMap(parts, UPLOAD_CONCURRENCY, async (part) => {
       const start = (part.partNumber - 1) * partSize;
       const end = Math.min(start + partSize, fileSize);
-      const stream = fs.createReadStream(archivePath, { start, end: end - 1 });
+      const partLength = end - start;
 
-      const putResponse = await httpClient.sendStream("PUT", part.url, stream, {
-        "Content-Length": String(end - start),
-      });
-      const putStatus = putResponse.message.statusCode || 0;
-
-      if (putStatus !== 200) {
-        throw new Error(`Multipart upload part ${part.partNumber} failed: status ${putStatus}`);
-      }
-
-      const etag = putResponse.message.headers["etag"] || "";
+      const etag = await uploadPart(part.url, archivePath, start, partLength);
       completedParts[part.partNumber - 1] = { partNumber: part.partNumber, etag };
       core.info(`Uploaded part ${part.partNumber}/${parts.length}`);
     });
@@ -273,12 +264,37 @@ export async function downloadCache(
   archiveLocation: string,
   archivePath: string
 ): Promise<void> {
-  // Get content length first via HEAD
-  const headResponse = await httpClient.head(archiveLocation);
-  const contentLength = Number(headResponse.message.headers["content-length"] || "0");
+  // Try HEAD to get content-length; if it fails, fall back to single GET
+  let contentLength = 0;
+  try {
+    const headResponse = await httpClient.head(archiveLocation);
+    if (headResponse.message.statusCode === 200) {
+      contentLength = Number(headResponse.message.headers["content-length"] || "0");
+    }
+  } catch {
+    // HEAD not supported (common with presigned URLs) — try GET with Range to probe
+  }
 
-  if (contentLength === 0 || contentLength < DOWNLOAD_PART_SIZE) {
-    // Small file — single GET
+  // If HEAD didn't work, do a range request for first byte to get content-length
+  if (contentLength === 0) {
+    try {
+      const probeResponse = await httpClient.get(archiveLocation, { Range: "bytes=0-0" });
+      const rangeHeader = probeResponse.message.headers["content-range"] || "";
+      // content-range: bytes 0-0/524373026
+      const match = rangeHeader.match(/\/(\d+)$/);
+      if (match) {
+        contentLength = Number(match[1]);
+      }
+      // Consume and discard the probe response body
+      probeResponse.message.resume();
+    } catch {
+      // Fall through to single GET
+    }
+  }
+
+  if (contentLength === 0 || contentLength < DOWNLOAD_PART_SIZE * 2) {
+    // Small file or can't determine size — single GET
+    core.info("Downloading cache (single stream)");
     const response = await httpClient.get(archiveLocation);
     const statusCode = response.message.statusCode || 0;
     if (statusCode !== 200) {
@@ -337,6 +353,41 @@ export async function downloadCache(
   if (actualSize !== contentLength) {
     throw new Error(`Download size mismatch: expected ${contentLength}, got ${actualSize}`);
   }
+}
+
+// uploadPart uploads a file range to a presigned URL using native https for true parallelism.
+function uploadPart(url: string, filePath: string, start: number, length: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(url);
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || 443,
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: "PUT",
+      headers: {
+        "Content-Length": String(length),
+      },
+    };
+
+    const proto = parsedUrl.protocol === "https:" ? require("https") : require("http");
+    const req = proto.request(options, (res: any) => {
+      let body = "";
+      res.on("data", (chunk: string) => { body += chunk; });
+      res.on("end", () => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`Upload part failed: ${res.statusCode} ${body}`));
+          return;
+        }
+        const etag = res.headers["etag"] || "";
+        resolve(etag);
+      });
+    });
+
+    req.on("error", reject);
+
+    const stream = fs.createReadStream(filePath, { start, end: start + length - 1 });
+    stream.pipe(req);
+  });
 }
 
 // parallelMap executes an async function over items with a concurrency limit.
