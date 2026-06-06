@@ -97946,7 +97946,7 @@ const twirpPrefix = "/twirp/github.actions.results.api.v1.CacheService/";
 const httpClient = new http_client_1.HttpClient("ir-cache-action");
 const UPLOAD_CONCURRENCY = Number(process.env.IR_UPLOAD_CONCURRENCY || "4");
 const DOWNLOAD_CONCURRENCY = Number(process.env.IR_DOWNLOAD_CONCURRENCY || "8");
-const DOWNLOAD_PART_SIZE = Number(process.env.IR_DOWNLOAD_PART_SIZE || "16") * 1024 * 1024;
+const DOWNLOAD_PART_SIZE = Number(process.env.IR_DOWNLOAD_PART_SIZE || "64") * 1024 * 1024;
 function getBaseUrl() {
     let url = process.env.IR_CACHE_URL;
     if (!url) {

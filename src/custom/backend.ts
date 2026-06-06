@@ -43,7 +43,7 @@ const httpClient = new HttpClient("ir-cache-action");
 
 const UPLOAD_CONCURRENCY = Number(process.env.IR_UPLOAD_CONCURRENCY || "4");
 const DOWNLOAD_CONCURRENCY = Number(process.env.IR_DOWNLOAD_CONCURRENCY || "8");
-const DOWNLOAD_PART_SIZE = Number(process.env.IR_DOWNLOAD_PART_SIZE || "16") * 1024 * 1024;
+const DOWNLOAD_PART_SIZE = Number(process.env.IR_DOWNLOAD_PART_SIZE || "64") * 1024 * 1024;
 
 function getBaseUrl(): string {
   let url = process.env.IR_CACHE_URL;
