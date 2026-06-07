@@ -89,6 +89,9 @@ export async function saveOnlyRun(earlyExit?: boolean): Promise<void> {
       process.exit(1);
     }
   }
+
+  renderMetricsSummary();
+
   if (earlyExit) {
     process.exit(0);
   }
