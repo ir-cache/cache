@@ -98536,9 +98536,74 @@ async function saveRun(earlyExit) {
             process.exit(1);
         }
     }
+    // Render build metrics to job summary (if collector ran)
+    renderMetricsSummary();
     if (earlyExit) {
         process.exit(0);
     }
+}
+function renderMetricsSummary() {
+    const metricsFile = process.env.IR_METRICS_FILE || "/tmp/ir-metrics.jsonl";
+    const summaryFile = process.env.GITHUB_STEP_SUMMARY;
+    if (!summaryFile || !fs.existsSync(metricsFile)) {
+        return;
+    }
+    try {
+        const lines = fs.readFileSync(metricsFile, "utf-8").trim().split("\n").filter(Boolean);
+        if (lines.length < 2)
+            return;
+        const samples = lines.map((l) => JSON.parse(l));
+        const cpuValues = samples.map((s) => s.cpu || 0);
+        const memValues = samples.map((s) => s.mem_used_mb || 0);
+        const memTotal = samples[0]?.mem_total_mb || 1;
+        const cpuAvg = avg(cpuValues);
+        const cpuPeak = Math.max(...cpuValues);
+        const memAvg = avg(memValues);
+        const memPeak = Math.max(...memValues);
+        const duration = samples.length > 1
+            ? samples[samples.length - 1].ts - samples[0].ts
+            : 0;
+        const cpuChart = sparkline(cpuValues, 0, 100);
+        const memChart = sparkline(memValues, 0, memTotal);
+        const summary = [
+            "",
+            "### 📊 IR Build Metrics",
+            "",
+            `| Metric | Chart | Avg | Peak |`,
+            `|--------|-------|-----|------|`,
+            `| CPU | \`${cpuChart}\` | ${cpuAvg.toFixed(0)}% | ${cpuPeak.toFixed(0)}% |`,
+            `| Memory | \`${memChart}\` | ${formatMB(memAvg)} | ${formatMB(memPeak)} / ${formatMB(memTotal)} |`,
+            "",
+            `*Duration: ${duration}s | Samples: ${samples.length}*`,
+            "",
+        ].join("\n");
+        fs.appendFileSync(summaryFile, summary);
+        core.info("Build metrics rendered to job summary");
+    }
+    catch (err) {
+        core.debug(`Failed to render metrics: ${err}`);
+    }
+}
+function sparkline(values, min, max) {
+    const blocks = " ▁▂▃▄▅▆▇█";
+    const range = max - min || 1;
+    // Downsample to max 20 points for readable chart
+    const step = Math.max(1, Math.floor(values.length / 20));
+    const sampled = values.filter((_, i) => i % step === 0);
+    return sampled
+        .map((v) => {
+        const idx = Math.min(8, Math.floor(((v - min) / range) * 8));
+        return blocks[idx];
+    })
+        .join("");
+}
+function avg(values) {
+    return values.reduce((a, b) => a + b, 0) / (values.length || 1);
+}
+function formatMB(mb) {
+    if (mb >= 1024)
+        return `${(mb / 1024).toFixed(1)}GB`;
+    return `${mb.toFixed(0)}MB`;
 }
 
 
