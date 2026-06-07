@@ -98522,6 +98522,7 @@ async function saveOnlyRun(earlyExit) {
             process.exit(1);
         }
     }
+    renderMetricsSummary();
     if (earlyExit) {
         process.exit(0);
     }
