@@ -309,45 +309,90 @@ export async function downloadCache(
     });
   }
 
-  // Large file — parallel range downloads
-  const numParts = Math.ceil(contentLength / DOWNLOAD_PART_SIZE);
-  core.info(`Parallel download: ${numParts} parts, ${Math.round(DOWNLOAD_PART_SIZE / (1024 * 1024))}MB each, concurrency ${DOWNLOAD_CONCURRENCY}`);
+  // Test if Range is supported with first part
+  const firstRangeResp = await httpClient.get(archiveLocation, {
+    Range: `bytes=0-${DOWNLOAD_PART_SIZE - 1}`,
+  });
+  const firstStatus = firstRangeResp.message.statusCode || 0;
 
-  // Pre-allocate the file
-  const fd = fs.openSync(archivePath, "w");
-  fs.ftruncateSync(fd, contentLength);
-  fs.closeSync(fd);
-
-  const parts = Array.from({ length: numParts }, (_, i) => i);
-
-  await parallelMap(parts, DOWNLOAD_CONCURRENCY, async (partIndex) => {
-    const start = partIndex * DOWNLOAD_PART_SIZE;
-    const end = Math.min(start + DOWNLOAD_PART_SIZE - 1, contentLength - 1);
-
-    const rangeResponse = await httpClient.get(archiveLocation, {
-      Range: `bytes=${start}-${end}`,
+  if (firstStatus !== 206) {
+    // Range not supported — fall back to single stream
+    core.info(`Downloading ${Math.round(contentLength / (1024 * 1024))}MB (single stream)...`);
+    // Consume first response as the full download
+    const fileStream = fs.createWriteStream(archivePath);
+    await new Promise<void>((resolve, reject) => {
+      firstRangeResp.message.pipe(fileStream);
+      firstRangeResp.message.on("error", reject);
+      fileStream.on("finish", resolve);
+      fileStream.on("error", reject);
     });
+  } else {
+    // Range IS supported — do parallel download with timeout
+    const numParts = Math.ceil(contentLength / DOWNLOAD_PART_SIZE);
+    core.info(`Parallel download: ${numParts} parts, ${Math.round(DOWNLOAD_PART_SIZE / (1024 * 1024))}MB each, concurrency ${DOWNLOAD_CONCURRENCY}`);
 
-    const statusCode = rangeResponse.message.statusCode || 0;
-    if (statusCode !== 206 && statusCode !== 200) {
-      throw new Error(`Range download failed: status ${statusCode} for bytes ${start}-${end}`);
-    }
+    // Pre-allocate the file and write first part
+    const fd = fs.openSync(archivePath, "w");
+    fs.ftruncateSync(fd, contentLength);
+    fs.closeSync(fd);
 
-    const chunks: Buffer[] = [];
-    return new Promise<void>((resolve, reject) => {
-      rangeResponse.message.on("data", (chunk: Buffer) => {
-        chunks.push(chunk);
-      });
-      rangeResponse.message.on("end", () => {
-        const data = Buffer.concat(chunks);
-        const fd = fs.openSync(archivePath, "r+");
-        fs.writeSync(fd, data, 0, data.length, start);
-        fs.closeSync(fd);
+    // Write first part (already downloaded)
+    const firstChunks: Buffer[] = [];
+    await new Promise<void>((resolve, reject) => {
+      firstRangeResp.message.on("data", (chunk: Buffer) => firstChunks.push(chunk));
+      firstRangeResp.message.on("end", () => {
+        const data = Buffer.concat(firstChunks);
+        const wfd = fs.openSync(archivePath, "r+");
+        fs.writeSync(wfd, data, 0, data.length, 0);
+        fs.closeSync(wfd);
         resolve();
       });
-      rangeResponse.message.on("error", reject);
+      firstRangeResp.message.on("error", reject);
     });
-  });
+
+    // Download remaining parts in parallel with timeout
+    const remainingParts = Array.from({ length: numParts - 1 }, (_, i) => i + 1);
+    const PART_TIMEOUT = 60000; // 60s per part
+
+    await parallelMap(remainingParts, DOWNLOAD_CONCURRENCY, async (partIndex) => {
+      const start = partIndex * DOWNLOAD_PART_SIZE;
+      const end = Math.min(start + DOWNLOAD_PART_SIZE - 1, contentLength - 1);
+
+      const partPromise = new Promise<void>(async (resolve, reject) => {
+        try {
+          const rangeResponse = await httpClient.get(archiveLocation, {
+            Range: `bytes=${start}-${end}`,
+          });
+
+          const statusCode = rangeResponse.message.statusCode || 0;
+          if (statusCode !== 206) {
+            reject(new Error(`Part ${partIndex} got status ${statusCode}`));
+            return;
+          }
+
+          const chunks: Buffer[] = [];
+          rangeResponse.message.on("data", (chunk: Buffer) => chunks.push(chunk));
+          rangeResponse.message.on("end", () => {
+            const data = Buffer.concat(chunks);
+            const wfd = fs.openSync(archivePath, "r+");
+            fs.writeSync(wfd, data, 0, data.length, start);
+            fs.closeSync(wfd);
+            resolve();
+          });
+          rangeResponse.message.on("error", reject);
+        } catch (err) {
+          reject(err);
+        }
+      });
+
+      // Timeout wrapper
+      const timeoutPromise = new Promise<void>((_, reject) => {
+        setTimeout(() => reject(new Error(`Part ${partIndex} timed out after ${PART_TIMEOUT}ms`)), PART_TIMEOUT);
+      });
+
+      await Promise.race([partPromise, timeoutPromise]);
+    });
+  }
 
   const actualSize = fs.statSync(archivePath).size;
   if (actualSize !== contentLength) {
