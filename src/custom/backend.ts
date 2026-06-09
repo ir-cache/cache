@@ -264,140 +264,29 @@ export async function downloadCache(
   archiveLocation: string,
   archivePath: string
 ): Promise<void> {
-  // Try HEAD to get content-length; if it fails, fall back to single GET
-  let contentLength = 0;
-  try {
-    const headResponse = await httpClient.head(archiveLocation);
-    if (headResponse.message.statusCode === 200) {
-      contentLength = Number(headResponse.message.headers["content-length"] || "0");
-    }
-  } catch {
-    // HEAD not supported (common with presigned URLs) — try GET with Range to probe
+  // Simple single-stream download from presigned S3 URL
+  // (S3 presigned URLs don't reliably support Range requests for parallel download)
+  core.info("Downloading cache...");
+  const response = await httpClient.get(archiveLocation);
+  const statusCode = response.message.statusCode || 0;
+  if (statusCode !== 200) {
+    throw new Error(`Download failed with status ${statusCode}`);
   }
-
-  // If HEAD didn't work, do a range request for first byte to get content-length
-  if (contentLength === 0) {
-    try {
-      const probeResponse = await httpClient.get(archiveLocation, { Range: "bytes=0-0" });
-      const rangeHeader = probeResponse.message.headers["content-range"] || "";
-      // content-range: bytes 0-0/524373026
-      const match = rangeHeader.match(/\/(\d+)$/);
-      if (match) {
-        contentLength = Number(match[1]);
-      }
-      // Consume and discard the probe response body
-      probeResponse.message.resume();
-    } catch {
-      // Fall through to single GET
-    }
-  }
-
-  if (contentLength === 0 || contentLength < DOWNLOAD_PART_SIZE * 2) {
-    // Small file or can't determine size — single GET
-    core.info("Downloading cache (single stream)");
-    const response = await httpClient.get(archiveLocation);
-    const statusCode = response.message.statusCode || 0;
-    if (statusCode !== 200) {
-      throw new Error(`Download failed with status ${statusCode}`);
-    }
-    const fileStream = fs.createWriteStream(archivePath);
-    return new Promise((resolve, reject) => {
-      response.message.pipe(fileStream);
-      response.message.on("error", reject);
-      fileStream.on("finish", resolve);
-      fileStream.on("error", reject);
+  const fileStream = fs.createWriteStream(archivePath);
+  return new Promise((resolve, reject) => {
+    let downloaded = 0;
+    response.message.on("data", (chunk: Buffer) => {
+      downloaded += chunk.length;
     });
-  }
-
-  // Test if Range is supported with first part
-  const firstRangeResp = await httpClient.get(archiveLocation, {
-    Range: `bytes=0-${DOWNLOAD_PART_SIZE - 1}`,
+    response.message.pipe(fileStream);
+    response.message.on("error", reject);
+    fileStream.on("finish", () => {
+      core.info(`Downloaded ${Math.round(downloaded / (1024 * 1024))}MB`);
+      resolve();
+    });
+    fileStream.on("error", reject);
   });
-  const firstStatus = firstRangeResp.message.statusCode || 0;
 
-  if (firstStatus !== 206) {
-    // Range not supported — fall back to single stream
-    core.info(`Downloading ${Math.round(contentLength / (1024 * 1024))}MB (single stream)...`);
-    // Consume first response as the full download
-    const fileStream = fs.createWriteStream(archivePath);
-    await new Promise<void>((resolve, reject) => {
-      firstRangeResp.message.pipe(fileStream);
-      firstRangeResp.message.on("error", reject);
-      fileStream.on("finish", resolve);
-      fileStream.on("error", reject);
-    });
-  } else {
-    // Range IS supported — do parallel download with timeout
-    const numParts = Math.ceil(contentLength / DOWNLOAD_PART_SIZE);
-    core.info(`Parallel download: ${numParts} parts, ${Math.round(DOWNLOAD_PART_SIZE / (1024 * 1024))}MB each, concurrency ${DOWNLOAD_CONCURRENCY}`);
-
-    // Pre-allocate the file and write first part
-    const fd = fs.openSync(archivePath, "w");
-    fs.ftruncateSync(fd, contentLength);
-    fs.closeSync(fd);
-
-    // Write first part (already downloaded)
-    const firstChunks: Buffer[] = [];
-    await new Promise<void>((resolve, reject) => {
-      firstRangeResp.message.on("data", (chunk: Buffer) => firstChunks.push(chunk));
-      firstRangeResp.message.on("end", () => {
-        const data = Buffer.concat(firstChunks);
-        const wfd = fs.openSync(archivePath, "r+");
-        fs.writeSync(wfd, data, 0, data.length, 0);
-        fs.closeSync(wfd);
-        resolve();
-      });
-      firstRangeResp.message.on("error", reject);
-    });
-
-    // Download remaining parts in parallel with timeout
-    const remainingParts = Array.from({ length: numParts - 1 }, (_, i) => i + 1);
-    const PART_TIMEOUT = 60000; // 60s per part
-
-    await parallelMap(remainingParts, DOWNLOAD_CONCURRENCY, async (partIndex) => {
-      const start = partIndex * DOWNLOAD_PART_SIZE;
-      const end = Math.min(start + DOWNLOAD_PART_SIZE - 1, contentLength - 1);
-
-      const partPromise = new Promise<void>(async (resolve, reject) => {
-        try {
-          const rangeResponse = await httpClient.get(archiveLocation, {
-            Range: `bytes=${start}-${end}`,
-          });
-
-          const statusCode = rangeResponse.message.statusCode || 0;
-          if (statusCode !== 206) {
-            reject(new Error(`Part ${partIndex} got status ${statusCode}`));
-            return;
-          }
-
-          const chunks: Buffer[] = [];
-          rangeResponse.message.on("data", (chunk: Buffer) => chunks.push(chunk));
-          rangeResponse.message.on("end", () => {
-            const data = Buffer.concat(chunks);
-            const wfd = fs.openSync(archivePath, "r+");
-            fs.writeSync(wfd, data, 0, data.length, start);
-            fs.closeSync(wfd);
-            resolve();
-          });
-          rangeResponse.message.on("error", reject);
-        } catch (err) {
-          reject(err);
-        }
-      });
-
-      // Timeout wrapper
-      const timeoutPromise = new Promise<void>((_, reject) => {
-        setTimeout(() => reject(new Error(`Part ${partIndex} timed out after ${PART_TIMEOUT}ms`)), PART_TIMEOUT);
-      });
-
-      await Promise.race([partPromise, timeoutPromise]);
-    });
-  }
-
-  const actualSize = fs.statSync(archivePath).size;
-  if (actualSize !== contentLength) {
-    throw new Error(`Download size mismatch: expected ${contentLength}, got ${actualSize}`);
-  }
 }
 
 // uploadPart uploads a file range to a presigned URL using native https for true parallelism.
