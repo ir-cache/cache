@@ -97941,10 +97941,11 @@ const crypto = __importStar(__nccwpck_require__(76982));
 const fs = __importStar(__nccwpck_require__(79896));
 const core = __importStar(__nccwpck_require__(37484));
 const http_client_1 = __nccwpck_require__(54844);
+const downloadUtils_1 = __nccwpck_require__(118);
 const versionSalt = "1.0";
 const twirpPrefix = "/twirp/github.actions.results.api.v1.CacheService/";
 const httpClient = new http_client_1.HttpClient("ir-cache-action");
-const UPLOAD_CONCURRENCY = Number(process.env.IR_UPLOAD_CONCURRENCY || "4");
+const UPLOAD_CONCURRENCY = Number(process.env.IR_UPLOAD_CONCURRENCY || "8");
 const DOWNLOAD_CONCURRENCY = Number(process.env.IR_DOWNLOAD_CONCURRENCY || "8");
 const DOWNLOAD_PART_SIZE = Number(process.env.IR_DOWNLOAD_PART_SIZE || "64") * 1024 * 1024;
 function getBaseUrl() {
@@ -98107,28 +98108,8 @@ async function saveCache(key, paths, archivePath, options) {
     core.info("Cache saved successfully.");
 }
 async function downloadCache(archiveLocation, archivePath) {
-    // Simple single-stream download from presigned S3 URL
-    // (S3 presigned URLs don't reliably support Range requests for parallel download)
-    core.info("Downloading cache...");
-    const response = await httpClient.get(archiveLocation);
-    const statusCode = response.message.statusCode || 0;
-    if (statusCode !== 200) {
-        throw new Error(`Download failed with status ${statusCode}`);
-    }
-    const fileStream = fs.createWriteStream(archivePath);
-    return new Promise((resolve, reject) => {
-        let downloaded = 0;
-        response.message.on("data", (chunk) => {
-            downloaded += chunk.length;
-        });
-        response.message.pipe(fileStream);
-        response.message.on("error", reject);
-        fileStream.on("finish", () => {
-            core.info(`Downloaded ${Math.round(downloaded / (1024 * 1024))}MB`);
-            resolve();
-        });
-        fileStream.on("error", reject);
-    });
+    core.info(`Downloading cache (concurrency=${DOWNLOAD_CONCURRENCY}, segment=${Math.round(DOWNLOAD_PART_SIZE / (1024 * 1024))}MB)...`);
+    await (0, downloadUtils_1.downloadCacheParallel)(archiveLocation, archivePath, DOWNLOAD_CONCURRENCY, DOWNLOAD_PART_SIZE);
 }
 // uploadPart uploads a file range to a presigned URL using native https for true parallelism.
 function uploadPart(url, filePath, start, length) {
@@ -98345,6 +98326,273 @@ async function saveCache(paths, key, options, enableCrossOsArchive = false) {
         }
     }
     return -1;
+}
+
+
+/***/ }),
+
+/***/ 118:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.downloadCacheParallel = downloadCacheParallel;
+const core = __importStar(__nccwpck_require__(37484));
+const fs = __importStar(__nccwpck_require__(79896));
+const https = __importStar(__nccwpck_require__(65692));
+const http = __importStar(__nccwpck_require__(58611));
+class DownloadProgress {
+    contentLength;
+    bytesDownloaded;
+    startTime;
+    timer;
+    constructor(contentLength) {
+        this.contentLength = contentLength;
+        this.bytesDownloaded = 0;
+        this.startTime = Date.now();
+    }
+    update(bytes) {
+        this.bytesDownloaded = bytes;
+    }
+    startDisplayTimer() {
+        this.timer = setInterval(() => this.display(), 5000);
+    }
+    stopDisplayTimer() {
+        if (this.timer) {
+            clearInterval(this.timer);
+            this.timer = undefined;
+        }
+        this.display();
+    }
+    display() {
+        const elapsed = (Date.now() - this.startTime) / 1000;
+        const speed = (this.bytesDownloaded / (1024 * 1024) / elapsed).toFixed(1);
+        const pct = ((100 * this.bytesDownloaded) / this.contentLength).toFixed(1);
+        core.info(`Downloaded ${Math.round(this.bytesDownloaded / (1024 * 1024))}MB / ${Math.round(this.contentLength / (1024 * 1024))}MB (${pct}%) at ${speed} MB/s`);
+    }
+}
+function downloadSegment(url, offset, count, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        const parsedUrl = new URL(url);
+        const client = parsedUrl.protocol === "https:" ? https : http;
+        const options = {
+            hostname: parsedUrl.hostname,
+            port: parsedUrl.port || (parsedUrl.protocol === "https:" ? 443 : 80),
+            path: parsedUrl.pathname + parsedUrl.search,
+            method: "GET",
+            headers: {
+                Range: `bytes=${offset}-${offset + count - 1}`,
+            },
+            timeout: timeoutMs,
+        };
+        const req = client.request(options, (res) => {
+            if (res.statusCode !== 206 && res.statusCode !== 200) {
+                reject(new Error(`Segment download failed: status ${res.statusCode} for range ${offset}-${offset + count - 1}`));
+                return;
+            }
+            const chunks = [];
+            res.on("data", (chunk) => chunks.push(chunk));
+            res.on("end", () => {
+                const buffer = Buffer.concat(chunks);
+                resolve({ offset, count: buffer.length, buffer });
+            });
+            res.on("error", reject);
+        });
+        req.on("timeout", () => {
+            req.destroy();
+            reject(new Error(`Segment timeout after ${timeoutMs}ms for range ${offset}-${offset + count - 1}`));
+        });
+        req.on("error", reject);
+        req.end();
+    });
+}
+async function downloadSegmentWithRetry(url, offset, count, maxRetries = 5, timeoutMs = 30000) {
+    let lastError;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            return await downloadSegment(url, offset, count, timeoutMs);
+        }
+        catch (err) {
+            lastError = err;
+            if (attempt < maxRetries) {
+                const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
+                core.debug(`Segment ${offset} failed (attempt ${attempt}/${maxRetries}): ${lastError.message}. Retrying in ${delay}ms...`);
+                await new Promise((r) => setTimeout(r, delay));
+            }
+        }
+    }
+    throw lastError;
+}
+function probeRangeSupport(url) {
+    return new Promise((resolve, reject) => {
+        const parsedUrl = new URL(url);
+        const client = parsedUrl.protocol === "https:" ? https : http;
+        const options = {
+            hostname: parsedUrl.hostname,
+            port: parsedUrl.port || (parsedUrl.protocol === "https:" ? 443 : 80),
+            path: parsedUrl.pathname + parsedUrl.search,
+            method: "GET",
+            headers: { Range: "bytes=0-0" },
+            timeout: 10000,
+        };
+        const req = client.request(options, (res) => {
+            res.resume();
+            if (res.statusCode === 206) {
+                const contentRange = res.headers["content-range"];
+                const match = contentRange?.match(/bytes \d+-\d+\/(\d+)/);
+                if (match) {
+                    resolve(parseInt(match[1]));
+                }
+                else {
+                    reject(new Error("Content-Range header missing or malformed"));
+                }
+            }
+            else if (res.statusCode === 200) {
+                const cl = res.headers["content-length"];
+                if (cl) {
+                    resolve(-parseInt(cl)); // Negative = Range not supported, use single stream
+                }
+                else {
+                    reject(new Error("No Content-Length in response"));
+                }
+            }
+            else {
+                reject(new Error(`Probe failed with status ${res.statusCode}`));
+            }
+        });
+        req.on("timeout", () => {
+            req.destroy();
+            reject(new Error("Probe timeout"));
+        });
+        req.on("error", reject);
+        req.end();
+    });
+}
+async function downloadCacheParallel(archiveLocation, archivePath, concurrency, partSize) {
+    // Probe for Range request support and get total size
+    let totalSize;
+    try {
+        totalSize = await probeRangeSupport(archiveLocation);
+    }
+    catch (err) {
+        core.warning(`Range probe failed: ${err.message}. Falling back to single stream.`);
+        return downloadSingleStream(archiveLocation, archivePath);
+    }
+    if (totalSize < 0) {
+        core.info("Server does not support Range requests. Using single stream.");
+        return downloadSingleStream(archiveLocation, archivePath);
+    }
+    core.info(`Parallel download: ${Math.round(totalSize / (1024 * 1024))}MB, ${concurrency} concurrent segments of ${Math.round(partSize / (1024 * 1024))}MB`);
+    const fd = await fs.promises.open(archivePath, "w");
+    const progress = new DownloadProgress(totalSize);
+    progress.startDisplayTimer();
+    try {
+        // Build segment list
+        const segments = [];
+        for (let offset = 0; offset < totalSize; offset += partSize) {
+            const count = Math.min(partSize, totalSize - offset);
+            segments.push({ offset, count });
+        }
+        // Process with bounded concurrency
+        let bytesDownloaded = 0;
+        const activeDownloads = new Map();
+        const writeSegment = async () => {
+            const segment = await Promise.race(activeDownloads.values());
+            await fd.write(segment.buffer, 0, segment.count, segment.offset);
+            bytesDownloaded += segment.count;
+            progress.update(bytesDownloaded);
+            activeDownloads.delete(segment.offset);
+        };
+        for (const seg of segments) {
+            const promise = downloadSegmentWithRetry(archiveLocation, seg.offset, seg.count);
+            activeDownloads.set(seg.offset, promise);
+            if (activeDownloads.size >= concurrency) {
+                await writeSegment();
+            }
+        }
+        // Drain remaining
+        while (activeDownloads.size > 0) {
+            await writeSegment();
+        }
+        if (bytesDownloaded !== totalSize) {
+            throw new Error(`Download validation failed: expected ${totalSize} bytes, got ${bytesDownloaded}`);
+        }
+    }
+    finally {
+        progress.stopDisplayTimer();
+        await fd.close();
+    }
+}
+function downloadSingleStream(url, archivePath) {
+    return new Promise((resolve, reject) => {
+        const parsedUrl = new URL(url);
+        const client = parsedUrl.protocol === "https:" ? https : http;
+        const options = {
+            hostname: parsedUrl.hostname,
+            port: parsedUrl.port || (parsedUrl.protocol === "https:" ? 443 : 80),
+            path: parsedUrl.pathname + parsedUrl.search,
+            method: "GET",
+            timeout: 300000,
+        };
+        const fileStream = fs.createWriteStream(archivePath);
+        const req = client.request(options, (res) => {
+            if (res.statusCode !== 200) {
+                reject(new Error(`Download failed with status ${res.statusCode}`));
+                return;
+            }
+            let downloaded = 0;
+            res.on("data", (chunk) => {
+                downloaded += chunk.length;
+            });
+            res.pipe(fileStream);
+            fileStream.on("finish", () => {
+                core.info(`Downloaded ${Math.round(downloaded / (1024 * 1024))}MB (single stream)`);
+                resolve();
+            });
+            fileStream.on("error", reject);
+            res.on("error", reject);
+        });
+        req.on("timeout", () => {
+            req.destroy();
+            reject(new Error("Download timeout"));
+        });
+        req.on("error", reject);
+        req.end();
+    });
 }
 
 
