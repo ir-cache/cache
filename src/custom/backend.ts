@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as core from "@actions/core";
 import { HttpClient } from "@actions/http-client";
 import * as http from "http";
+import { downloadCacheParallel } from "./downloadUtils";
 
 export interface ArtifactCacheEntry {
   cacheKey?: string;
@@ -41,7 +42,7 @@ const versionSalt = "1.0";
 const twirpPrefix = "/twirp/github.actions.results.api.v1.CacheService/";
 const httpClient = new HttpClient("ir-cache-action");
 
-const UPLOAD_CONCURRENCY = Number(process.env.IR_UPLOAD_CONCURRENCY || "4");
+const UPLOAD_CONCURRENCY = Number(process.env.IR_UPLOAD_CONCURRENCY || "8");
 const DOWNLOAD_CONCURRENCY = Number(process.env.IR_DOWNLOAD_CONCURRENCY || "8");
 const DOWNLOAD_PART_SIZE = Number(process.env.IR_DOWNLOAD_PART_SIZE || "64") * 1024 * 1024;
 
@@ -264,29 +265,13 @@ export async function downloadCache(
   archiveLocation: string,
   archivePath: string
 ): Promise<void> {
-  // Simple single-stream download from presigned S3 URL
-  // (S3 presigned URLs don't reliably support Range requests for parallel download)
-  core.info("Downloading cache...");
-  const response = await httpClient.get(archiveLocation);
-  const statusCode = response.message.statusCode || 0;
-  if (statusCode !== 200) {
-    throw new Error(`Download failed with status ${statusCode}`);
-  }
-  const fileStream = fs.createWriteStream(archivePath);
-  return new Promise((resolve, reject) => {
-    let downloaded = 0;
-    response.message.on("data", (chunk: Buffer) => {
-      downloaded += chunk.length;
-    });
-    response.message.pipe(fileStream);
-    response.message.on("error", reject);
-    fileStream.on("finish", () => {
-      core.info(`Downloaded ${Math.round(downloaded / (1024 * 1024))}MB`);
-      resolve();
-    });
-    fileStream.on("error", reject);
-  });
-
+  core.info(`Downloading cache (concurrency=${DOWNLOAD_CONCURRENCY}, segment=${Math.round(DOWNLOAD_PART_SIZE / (1024 * 1024))}MB)...`);
+  await downloadCacheParallel(
+    archiveLocation,
+    archivePath,
+    DOWNLOAD_CONCURRENCY,
+    DOWNLOAD_PART_SIZE
+  );
 }
 
 // uploadPart uploads a file range to a presigned URL using native https for true parallelism.
