@@ -97947,7 +97947,7 @@ const twirpPrefix = "/twirp/github.actions.results.api.v1.CacheService/";
 const httpClient = new http_client_1.HttpClient("ir-cache-action");
 const UPLOAD_CONCURRENCY = Number(process.env.IR_UPLOAD_CONCURRENCY || "8");
 const DOWNLOAD_CONCURRENCY = Number(process.env.IR_DOWNLOAD_CONCURRENCY || "8");
-const DOWNLOAD_PART_SIZE = Number(process.env.IR_DOWNLOAD_PART_SIZE || "64") * 1024 * 1024;
+const DOWNLOAD_PART_SIZE = Number(process.env.IR_DOWNLOAD_PART_SIZE || "32") * 1024 * 1024;
 function getBaseUrl() {
     let url = process.env.IR_CACHE_URL;
     if (!url) {
@@ -98440,7 +98440,7 @@ function downloadSegment(url, offset, count, timeoutMs) {
         req.end();
     });
 }
-async function downloadSegmentWithRetry(url, offset, count, maxRetries = 5, timeoutMs = 30000) {
+async function downloadSegmentWithRetry(url, offset, count, maxRetries = 5, timeoutMs = 120000) {
     let lastError;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
@@ -98450,8 +98450,11 @@ async function downloadSegmentWithRetry(url, offset, count, maxRetries = 5, time
             lastError = err;
             if (attempt < maxRetries) {
                 const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
-                core.debug(`Segment ${offset} failed (attempt ${attempt}/${maxRetries}): ${lastError.message}. Retrying in ${delay}ms...`);
+                core.warning(`Segment at offset ${Math.round(offset / (1024 * 1024))}MB failed (attempt ${attempt}/${maxRetries}): ${lastError.message}. Retrying in ${delay}ms...`);
                 await new Promise((r) => setTimeout(r, delay));
+            }
+            else {
+                core.error(`Segment at offset ${Math.round(offset / (1024 * 1024))}MB failed after ${maxRetries} attempts: ${lastError.message}`);
             }
         }
     }
