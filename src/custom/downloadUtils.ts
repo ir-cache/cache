@@ -100,7 +100,7 @@ async function downloadSegmentWithRetry(
   offset: number,
   count: number,
   maxRetries: number = 5,
-  timeoutMs: number = 30000
+  timeoutMs: number = 120000
 ): Promise<DownloadSegment> {
   let lastError: Error | undefined;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -110,10 +110,14 @@ async function downloadSegmentWithRetry(
       lastError = err as Error;
       if (attempt < maxRetries) {
         const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
-        core.debug(
-          `Segment ${offset} failed (attempt ${attempt}/${maxRetries}): ${lastError.message}. Retrying in ${delay}ms...`
+        core.warning(
+          `Segment at offset ${Math.round(offset / (1024 * 1024))}MB failed (attempt ${attempt}/${maxRetries}): ${lastError.message}. Retrying in ${delay}ms...`
         );
         await new Promise((r) => setTimeout(r, delay));
+      } else {
+        core.error(
+          `Segment at offset ${Math.round(offset / (1024 * 1024))}MB failed after ${maxRetries} attempts: ${lastError.message}`
+        );
       }
     }
   }
