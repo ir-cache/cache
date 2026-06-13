@@ -98385,8 +98385,11 @@ class DownloadProgress {
         this.bytesDownloaded = 0;
         this.startTime = Date.now();
     }
-    update(bytes) {
-        this.bytesDownloaded = bytes;
+    addBytes(n) {
+        this.bytesDownloaded += n;
+    }
+    get downloaded() {
+        return this.bytesDownloaded;
     }
     startDisplayTimer() {
         this.timer = setInterval(() => this.display(), 5000);
@@ -98405,7 +98408,9 @@ class DownloadProgress {
         core.info(`Downloaded ${Math.round(this.bytesDownloaded / (1024 * 1024))}MB / ${Math.round(this.contentLength / (1024 * 1024))}MB (${pct}%) at ${speed} MB/s`);
     }
 }
-function downloadSegment(url, offset, count, timeoutMs) {
+// Stream a range directly to the file descriptor at the correct offset.
+// Memory usage is bounded by Node's internal stream buffer (~64KB) per connection.
+function downloadSegmentToFile(url, fd, offset, count, timeoutMs, progress) {
     return new Promise((resolve, reject) => {
         const parsedUrl = new URL(url);
         const client = parsedUrl.protocol === "https:" ? https : http;
@@ -98419,18 +98424,49 @@ function downloadSegment(url, offset, count, timeoutMs) {
             },
             timeout: timeoutMs,
         };
+        let bytesWritten = 0;
+        let writeOffset = offset;
+        let writing = false;
+        let ended = false;
+        let errored = false;
         const req = client.request(options, (res) => {
             if (res.statusCode !== 206 && res.statusCode !== 200) {
                 reject(new Error(`Segment download failed: status ${res.statusCode} for range ${offset}-${offset + count - 1}`));
                 return;
             }
-            const chunks = [];
-            res.on("data", (chunk) => chunks.push(chunk));
-            res.on("end", () => {
-                const buffer = Buffer.concat(chunks);
-                resolve({ offset, count: buffer.length, buffer });
+            res.on("data", (chunk) => {
+                if (errored)
+                    return;
+                // Pause the stream while we write to prevent unbounded buffering
+                res.pause();
+                writing = true;
+                fd.write(chunk, 0, chunk.length, writeOffset).then(({ bytesWritten: n }) => {
+                    writeOffset += n;
+                    bytesWritten += n;
+                    progress.addBytes(n);
+                    writing = false;
+                    if (ended) {
+                        resolve(bytesWritten);
+                    }
+                    else {
+                        res.resume();
+                    }
+                }).catch((err) => {
+                    errored = true;
+                    res.destroy();
+                    reject(err);
+                });
             });
-            res.on("error", reject);
+            res.on("end", () => {
+                ended = true;
+                if (!writing) {
+                    resolve(bytesWritten);
+                }
+            });
+            res.on("error", (err) => {
+                errored = true;
+                reject(err);
+            });
         });
         req.on("timeout", () => {
             req.destroy();
@@ -98440,11 +98476,11 @@ function downloadSegment(url, offset, count, timeoutMs) {
         req.end();
     });
 }
-async function downloadSegmentWithRetry(url, offset, count, maxRetries = 5, timeoutMs = 120000) {
+async function downloadSegmentWithRetry(url, fd, offset, count, progress, maxRetries = 5, timeoutMs = 120000) {
     let lastError;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            return await downloadSegment(url, offset, count, timeoutMs);
+            return await downloadSegmentToFile(url, fd, offset, count, timeoutMs, progress);
         }
         catch (err) {
             lastError = err;
@@ -98520,7 +98556,9 @@ async function downloadCacheParallel(archiveLocation, archivePath, concurrency, 
         return downloadSingleStream(archiveLocation, archivePath);
     }
     core.info(`Parallel download: ${Math.round(totalSize / (1024 * 1024))}MB, ${concurrency} concurrent segments of ${Math.round(partSize / (1024 * 1024))}MB`);
+    // Pre-allocate file to full size
     const fd = await fs.promises.open(archivePath, "w");
+    await fd.truncate(totalSize);
     const progress = new DownloadProgress(totalSize);
     progress.startDisplayTimer();
     try {
@@ -98530,29 +98568,24 @@ async function downloadCacheParallel(archiveLocation, archivePath, concurrency, 
             const count = Math.min(partSize, totalSize - offset);
             segments.push({ offset, count });
         }
-        // Process with bounded concurrency
-        let bytesDownloaded = 0;
-        const activeDownloads = new Map();
-        const writeSegment = async () => {
-            const segment = await Promise.race(activeDownloads.values());
-            await fd.write(segment.buffer, 0, segment.count, segment.offset);
-            bytesDownloaded += segment.count;
-            progress.update(bytesDownloaded);
-            activeDownloads.delete(segment.offset);
-        };
+        // Process segments with bounded concurrency — streaming to file, not memory
+        const active = new Set();
         for (const seg of segments) {
-            const promise = downloadSegmentWithRetry(archiveLocation, seg.offset, seg.count);
-            activeDownloads.set(seg.offset, promise);
-            if (activeDownloads.size >= concurrency) {
-                await writeSegment();
+            const promise = downloadSegmentWithRetry(archiveLocation, fd, seg.offset, seg.count, progress).then((n) => {
+                active.delete(promise);
+                return n;
+            });
+            active.add(promise);
+            if (active.size >= concurrency) {
+                await Promise.race(active);
             }
         }
         // Drain remaining
-        while (activeDownloads.size > 0) {
-            await writeSegment();
+        while (active.size > 0) {
+            await Promise.race(active);
         }
-        if (bytesDownloaded !== totalSize) {
-            throw new Error(`Download validation failed: expected ${totalSize} bytes, got ${bytesDownloaded}`);
+        if (progress.downloaded !== totalSize) {
+            throw new Error(`Download validation failed: expected ${totalSize} bytes, got ${progress.downloaded}`);
         }
     }
     finally {
