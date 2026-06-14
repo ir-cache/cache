@@ -225,17 +225,8 @@ export async function saveCache(
       throw new Error(`FinalizeCacheEntryUpload failed: ${finalizeStatus} ${finalizeResponseBody}`);
     }
   } else if (createResult.signedUploadUrl) {
-    // Single PUT upload
-    const stream = fs.createReadStream(archivePath);
-    const putResponse = await httpClient.sendStream("PUT", createResult.signedUploadUrl, stream, {
-      "Content-Length": String(fileSize),
-      "Content-Type": "application/octet-stream",
-    });
-    const putStatus = putResponse.message.statusCode || 0;
-
-    if (putStatus !== 200) {
-      throw new Error(`S3 upload failed: status ${putStatus}`);
-    }
+    // Single PUT upload using native http/https to handle both protocols
+    await uploadSingleFile(createResult.signedUploadUrl, archivePath, fileSize);
 
     core.info("Upload complete, finalizing...");
 
@@ -305,6 +296,41 @@ function uploadPart(url: string, filePath: string, start: number, length: number
     req.on("error", reject);
 
     const stream = fs.createReadStream(filePath, { start, end: start + length - 1 });
+    stream.pipe(req);
+  });
+}
+
+// uploadSingleFile uploads an entire file to a presigned URL using native http/https.
+function uploadSingleFile(url: string, filePath: string, fileSize: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(url);
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || (parsedUrl.protocol === "https:" ? 443 : 80),
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: "PUT",
+      headers: {
+        "Content-Length": String(fileSize),
+        "Content-Type": "application/octet-stream",
+      },
+    };
+
+    const proto = parsedUrl.protocol === "https:" ? require("https") : require("http");
+    const req = proto.request(options, (res: any) => {
+      let body = "";
+      res.on("data", (chunk: string) => { body += chunk; });
+      res.on("end", () => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`S3 upload failed: status ${res.statusCode} ${body}`));
+          return;
+        }
+        resolve();
+      });
+    });
+
+    req.on("error", reject);
+
+    const stream = fs.createReadStream(filePath);
     stream.pipe(req);
   });
 }
