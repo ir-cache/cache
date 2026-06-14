@@ -62,15 +62,28 @@ function getBaseUrl(): string {
 }
 
 export function getAuthHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {};
+
   const token = process.env.GITHUB_TOKEN;
   if (token) {
-    return { Authorization: `Bearer ${token}` };
+    headers["Authorization"] = `Bearer ${token}`;
+  } else {
+    const repo = process.env.GITHUB_REPOSITORY;
+    if (repo) {
+      headers["X-IR-Repository"] = repo;
+    } else {
+      throw new Error("No authentication available for IR cache");
+    }
   }
-  const repo = process.env.GITHUB_REPOSITORY;
-  if (repo) {
-    return { "X-IR-Repository": repo };
+
+  // Pass job ID for per-job cache byte tracking (IRcoin cost)
+  const runId = process.env.GITHUB_RUN_ID;
+  const jobName = process.env.GITHUB_JOB;
+  if (runId && jobName) {
+    headers["X-IR-Job-ID"] = `gh-${runId}-${jobName}`;
   }
-  throw new Error("No authentication available for IR cache");
+
+  return headers;
 }
 
 export function getCacheVersion(
