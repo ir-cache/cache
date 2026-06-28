@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 1.0.0)"
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  PACKAGE_NAME: ir-cache/cache
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@v1
+
+      - name: Bundle action
+        run: |
+          mkdir -p bundle
+          tar czf bundle/ir-cache-cache-v1.tar.gz action.yml dist/ restore/ save/
+
+      - name: Push to GHCR
+        run: |
+          cd bundle
+          oras push ${{ env.REGISTRY }}/${{ env.PACKAGE_NAME }}:v${{ inputs.version }} \
+            --artifact-type application/vnd.ir.action.v1 \
+            ir-cache-cache-v1.tar.gz:application/gzip
+
+          oras push ${{ env.REGISTRY }}/${{ env.PACKAGE_NAME }}:latest \
+            --artifact-type application/vnd.ir.action.v1 \
+            ir-cache-cache-v1.tar.gz:application/gzip
