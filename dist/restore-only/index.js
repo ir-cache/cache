@@ -97964,15 +97964,18 @@ function getBaseUrl() {
     return url.replace(/\/+$/, "");
 }
 function getAuthHeaders() {
+    const repo = process.env.GITHUB_REPOSITORY;
+    if (!repo) {
+        throw new Error("GITHUB_REPOSITORY is not available for IR cache scoping");
+    }
+    const headers = {
+        "X-GitHub-Repository": repo,
+    };
     const token = process.env.GITHUB_TOKEN;
     if (token) {
-        return { Authorization: `Bearer ${token}` };
+        headers.Authorization = `Bearer ${token}`;
     }
-    const repo = process.env.GITHUB_REPOSITORY;
-    if (repo) {
-        return { "X-IR-Repository": repo };
-    }
-    throw new Error("No authentication available for IR cache");
+    return headers;
 }
 function getCacheVersion(paths, compressionMethod, enableCrossOsArchive = false) {
     const components = paths.slice();
@@ -98334,11 +98337,7 @@ async function saveCache(paths, key, options, enableCrossOsArchive = false) {
         return 1;
     }
     catch (error) {
-        const typedError = error;
-        if (typedError.name === "ValidationError") {
-            throw error;
-        }
-        core.warning(`Failed to save: ${typedError.message}`);
+        throw error;
     }
     finally {
         try {
@@ -98348,7 +98347,6 @@ async function saveCache(paths, key, options, enableCrossOsArchive = false) {
             core.debug(`Failed to delete archive: ${error}`);
         }
     }
-    return -1;
 }
 
 

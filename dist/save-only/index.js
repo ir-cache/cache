@@ -97964,15 +97964,18 @@ function getBaseUrl() {
     return url.replace(/\/+$/, "");
 }
 function getAuthHeaders() {
+    const repo = process.env.GITHUB_REPOSITORY;
+    if (!repo) {
+        throw new Error("GITHUB_REPOSITORY is not available for IR cache scoping");
+    }
+    const headers = {
+        "X-GitHub-Repository": repo,
+    };
     const token = process.env.GITHUB_TOKEN;
     if (token) {
-        return { Authorization: `Bearer ${token}` };
+        headers.Authorization = `Bearer ${token}`;
     }
-    const repo = process.env.GITHUB_REPOSITORY;
-    if (repo) {
-        return { "X-IR-Repository": repo };
-    }
-    throw new Error("No authentication available for IR cache");
+    return headers;
 }
 function getCacheVersion(paths, compressionMethod, enableCrossOsArchive = false) {
     const components = paths.slice();
@@ -98334,11 +98337,7 @@ async function saveCache(paths, key, options, enableCrossOsArchive = false) {
         return 1;
     }
     catch (error) {
-        const typedError = error;
-        if (typedError.name === "ValidationError") {
-            throw error;
-        }
-        core.warning(`Failed to save: ${typedError.message}`);
+        throw error;
     }
     finally {
         try {
@@ -98348,7 +98347,6 @@ async function saveCache(paths, key, options, enableCrossOsArchive = false) {
             core.debug(`Failed to delete archive: ${error}`);
         }
     }
-    return -1;
 }
 
 
@@ -98753,42 +98751,40 @@ async function saveImpl(stateProvider) {
         }
     }
     catch (error) {
-        utils.logWarning(error.message);
+        throw error;
     }
     return cacheId;
 }
 async function saveOnlyRun(earlyExit) {
+    let failed = false;
     try {
         const cacheId = await saveImpl(new stateProvider_1.NullStateProvider());
         if (cacheId === -1) {
-            core.warning("Cache save failed.");
+            throw new Error("Cache save failed.");
         }
     }
     catch (err) {
-        console.error(err);
-        if (earlyExit) {
-            process.exit(1);
-        }
+        failed = true;
+        core.setFailed(err.message);
     }
     renderMetricsSummary();
     if (earlyExit) {
-        process.exit(0);
+        process.exit(failed ? 1 : 0);
     }
 }
 async function saveRun(earlyExit) {
+    let failed = false;
     try {
         await saveImpl(new stateProvider_1.StateProvider());
     }
     catch (err) {
-        console.error(err);
-        if (earlyExit) {
-            process.exit(1);
-        }
+        failed = true;
+        core.setFailed(err.message);
     }
     // Render build metrics to job summary (if collector ran)
     renderMetricsSummary();
     if (earlyExit) {
-        process.exit(0);
+        process.exit(failed ? 1 : 0);
     }
 }
 function renderMetricsSummary() {
