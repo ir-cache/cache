@@ -165,11 +165,7 @@ export async function saveCache(
 
     return 1;
   } catch (error) {
-    const typedError = error as Error;
-    if (typedError.name === "ValidationError") {
-      throw error;
-    }
-    core.warning(`Failed to save: ${typedError.message}`);
+    throw error;
   } finally {
     try {
       await utils.unlinkFile(archivePath);
@@ -177,6 +173,4 @@ export async function saveCache(
       core.debug(`Failed to delete archive: ${error}`);
     }
   }
-
-  return -1;
 }
