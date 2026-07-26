@@ -42,9 +42,48 @@ const versionSalt = "1.0";
 const twirpPrefix = "/twirp/github.actions.results.api.v1.CacheService/";
 const httpClient = new HttpClient("ir-cache-action");
 
-const UPLOAD_CONCURRENCY = Number(process.env.IR_UPLOAD_CONCURRENCY || "8");
-const DOWNLOAD_CONCURRENCY = Number(process.env.IR_DOWNLOAD_CONCURRENCY || "8");
-const DOWNLOAD_PART_SIZE = Number(process.env.IR_DOWNLOAD_PART_SIZE || "32") * 1024 * 1024;
+const MAX_MULTIPART_PARTS = 10_000;
+const MAX_ERROR_BODY_BYTES = 64 * 1024;
+
+function boundedInteger(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    core.warning(`${name}=${raw} is invalid; using ${fallback}`);
+    return fallback;
+  }
+  return value;
+}
+
+export function getTransferSettings() {
+  return {
+    uploadConcurrency: boundedInteger("IR_UPLOAD_CONCURRENCY", 8, 1, 32),
+    uploadMaxAttempts: boundedInteger("IR_UPLOAD_MAX_ATTEMPTS", 5, 1, 10),
+    uploadTimeoutMs: boundedInteger("IR_UPLOAD_TIMEOUT_MS", 120_000, 1_000, 600_000),
+    downloadConcurrency: boundedInteger("IR_DOWNLOAD_CONCURRENCY", 8, 1, 32),
+    downloadPartSize: boundedInteger("IR_DOWNLOAD_PART_SIZE", 32, 1, 512) * 1024 * 1024,
+  };
+}
+
+export function validateMultipartResponse(
+  multipart: NonNullable<CreateCacheEntryResponse["multipart"]>,
+  fileSize: number
+): void {
+  if (!multipart.uploadId || !Number.isSafeInteger(multipart.partSize) || multipart.partSize <= 0) {
+    throw new Error("CreateCacheEntry returned invalid multipart metadata");
+  }
+  const expectedParts = Math.ceil(fileSize / multipart.partSize);
+  const receivedParts = Array.isArray(multipart.parts) ? multipart.parts.length : 0;
+  if (expectedParts < 1 || expectedParts > MAX_MULTIPART_PARTS || receivedParts !== expectedParts) {
+    throw new Error(`CreateCacheEntry returned invalid multipart part count: expected ${expectedParts}, received ${receivedParts}`);
+  }
+  multipart.parts.forEach((part, index) => {
+    if (part.partNumber !== index + 1 || !part.url) {
+      throw new Error("CreateCacheEntry returned unordered or invalid multipart parts");
+    }
+  });
+}
 
 function getBaseUrl(): string {
   let url = process.env.IR_CACHE_URL;
@@ -161,6 +200,7 @@ export async function saveCache(
     options.enableCrossOsArchive
   );
   const fileSize = fs.statSync(archivePath).size;
+  const settings = getTransferSettings();
 
   core.info(
     `Cache Size: ~${Math.round(fileSize / (1024 * 1024))} MB (${fileSize} B)`
@@ -196,41 +236,42 @@ export async function saveCache(
   // Step 2: Upload to S3 via presigned URL(s)
   if (createResult.multipart) {
     const { uploadId, parts, partSize } = createResult.multipart;
-    core.info(`Multipart upload: ${parts.length} parts, ${Math.round(partSize / (1024 * 1024))}MB each, concurrency ${UPLOAD_CONCURRENCY}`);
+    try {
+      validateMultipartResponse(createResult.multipart, fileSize);
+      core.info(`Multipart upload: ${parts.length} parts, ${Math.round(partSize / (1024 * 1024))}MB each, concurrency ${settings.uploadConcurrency}`);
+      const completedParts: CompletedPart[] = new Array(parts.length);
 
-    const completedParts: CompletedPart[] = new Array(parts.length);
+      // Upload parts in parallel with concurrency limit using native https
+      await parallelMap(parts, settings.uploadConcurrency, async (part) => {
+        const start = (part.partNumber - 1) * partSize;
+        const end = Math.min(start + partSize, fileSize);
+        const partLength = end - start;
 
-    // Upload parts in parallel with concurrency limit using native https
-    await parallelMap(parts, UPLOAD_CONCURRENCY, async (part) => {
-      const start = (part.partNumber - 1) * partSize;
-      const end = Math.min(start + partSize, fileSize);
-      const partLength = end - start;
+        const etag = await withUploadRetry(`part ${part.partNumber}`, settings.uploadMaxAttempts, () =>
+          uploadPart(part.url, archivePath, start, partLength, settings.uploadTimeoutMs)
+        );
+        if (!etag) throw new Error(`Upload part ${part.partNumber} returned no ETag`);
+        completedParts[part.partNumber - 1] = { partNumber: part.partNumber, etag };
+        core.info(`Uploaded part ${part.partNumber}/${parts.length}`);
+      });
 
-      const etag = await uploadPart(part.url, archivePath, start, partLength);
-      completedParts[part.partNumber - 1] = { partNumber: part.partNumber, etag };
-      core.info(`Uploaded part ${part.partNumber}/${parts.length}`);
-    });
-
-    // Step 3: Finalize with completed parts
-    const finalizeUrl = `${baseUrl}${twirpPrefix}FinalizeCacheEntryUpload`;
-    const finalizeBody = JSON.stringify({
-      key,
-      version,
-      sizeBytes: String(fileSize),
-      uploadId,
-      parts: completedParts,
-    });
-
-    const finalizeResponse = await httpClient.post(finalizeUrl, finalizeBody, createHeaders);
-    const finalizeStatus = finalizeResponse.message.statusCode || 0;
-
-    if (finalizeStatus !== 200) {
-      const finalizeResponseBody = await finalizeResponse.readBody();
-      throw new Error(`FinalizeCacheEntryUpload failed: ${finalizeStatus} ${finalizeResponseBody}`);
+      const finalizeUrl = `${baseUrl}${twirpPrefix}FinalizeCacheEntryUpload`;
+      const finalizeBody = JSON.stringify({ key, version, sizeBytes: String(fileSize), uploadId, parts: completedParts });
+      const finalizeResponse = await httpClient.post(finalizeUrl, finalizeBody, createHeaders);
+      const finalizeStatus = finalizeResponse.message.statusCode || 0;
+      if (finalizeStatus !== 200) {
+        const finalizeResponseBody = await finalizeResponse.readBody();
+        throw new Error(`FinalizeCacheEntryUpload failed: ${finalizeStatus} ${finalizeResponseBody}`);
+      }
+    } catch (error) {
+      await abortMultipartUpload(baseUrl, key, version, uploadId, createHeaders);
+      throw error;
     }
   } else if (createResult.signedUploadUrl) {
     // Single PUT upload using native http/https to handle both protocols
-    await uploadSingleFile(createResult.signedUploadUrl, archivePath, fileSize);
+    await withUploadRetry("cache archive", settings.uploadMaxAttempts, () =>
+      uploadSingleFile(createResult.signedUploadUrl, archivePath, fileSize, settings.uploadTimeoutMs)
+    );
 
     core.info("Upload complete, finalizing...");
 
@@ -260,22 +301,72 @@ export async function downloadCache(
   archiveLocation: string,
   archivePath: string
 ): Promise<void> {
-  core.info(`Downloading cache (concurrency=${DOWNLOAD_CONCURRENCY}, segment=${Math.round(DOWNLOAD_PART_SIZE / (1024 * 1024))}MB)...`);
+  const settings = getTransferSettings();
+  core.info(`Downloading cache (concurrency=${settings.downloadConcurrency}, segment=${Math.round(settings.downloadPartSize / (1024 * 1024))}MB)...`);
   await downloadCacheParallel(
     archiveLocation,
     archivePath,
-    DOWNLOAD_CONCURRENCY,
-    DOWNLOAD_PART_SIZE
+    settings.downloadConcurrency,
+    settings.downloadPartSize
   );
 }
 
 // uploadPart uploads a file range to a presigned URL using native https for true parallelism.
-function uploadPart(url: string, filePath: string, start: number, length: number): Promise<string> {
+class UploadError extends Error {
+  constructor(message: string, readonly retryable: boolean) {
+    super(message);
+  }
+}
+
+export function isRetryableUploadStatus(statusCode: number): boolean {
+  return statusCode === 408 || statusCode === 429 || statusCode >= 500;
+}
+
+async function withUploadRetry<T>(description: string, maxAttempts: number, operation: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      const retryable = !(error instanceof UploadError) || error.retryable;
+      if (!retryable || attempt === maxAttempts) throw error;
+      const delayMs = Math.min(1_000 * 2 ** (attempt - 1), 8_000);
+      core.warning(`Upload ${description} failed (attempt ${attempt}/${maxAttempts}); retrying in ${delayMs}ms`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError;
+}
+
+async function abortMultipartUpload(
+  baseUrl: string,
+  key: string,
+  version: string,
+  uploadId: string,
+  headers: Record<string, string>
+): Promise<void> {
+  try {
+    const response = await httpClient.post(
+      `${baseUrl}${twirpPrefix}AbortCacheEntryUpload`,
+      JSON.stringify({ key, version, uploadId }),
+      headers
+    );
+    const status = response.message.statusCode || 0;
+    if (status !== 200) {
+      core.warning(`Unable to abort multipart cache upload ${uploadId}: status ${status}`);
+    }
+  } catch (error) {
+    core.warning(`Unable to abort multipart cache upload ${uploadId}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function uploadPart(url: string, filePath: string, start: number, length: number, timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const parsedUrl = new URL(url);
     const options = {
       hostname: parsedUrl.hostname,
-      port: parsedUrl.port || 443,
+      port: parsedUrl.port || (parsedUrl.protocol === "https:" ? 443 : 80),
       path: parsedUrl.pathname + parsedUrl.search,
       method: "PUT",
       headers: {
@@ -284,28 +375,39 @@ function uploadPart(url: string, filePath: string, start: number, length: number
     };
 
     const proto = parsedUrl.protocol === "https:" ? require("https") : require("http");
+    const stream = fs.createReadStream(filePath, { start, end: start + length - 1 });
+    let settled = false;
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      stream.destroy();
+      reject(error);
+    };
     const req = proto.request(options, (res: any) => {
       let body = "";
-      res.on("data", (chunk: string) => { body += chunk; });
+      res.on("data", (chunk: Buffer) => {
+        if (body.length < MAX_ERROR_BODY_BYTES) body += chunk.toString().slice(0, MAX_ERROR_BODY_BYTES - body.length);
+      });
       res.on("end", () => {
         if (res.statusCode !== 200) {
-          reject(new Error(`Upload part failed: ${res.statusCode} ${body}`));
+          fail(new UploadError(`Upload part failed: ${res.statusCode} ${body}`, isRetryableUploadStatus(res.statusCode || 0)));
           return;
         }
-        const etag = res.headers["etag"] || "";
+        settled = true;
+        const etagHeader = res.headers["etag"];
+        const etag = Array.isArray(etagHeader) ? etagHeader[0] || "" : etagHeader || "";
         resolve(etag);
       });
     });
-
-    req.on("error", reject);
-
-    const stream = fs.createReadStream(filePath, { start, end: start + length - 1 });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`upload timed out after ${timeoutMs}ms`)));
+    req.on("error", (error: Error) => fail(new UploadError(error.message, true)));
+    stream.on("error", fail);
     stream.pipe(req);
   });
 }
 
 // uploadSingleFile uploads an entire file to a presigned URL using native http/https.
-function uploadSingleFile(url: string, filePath: string, fileSize: number): Promise<void> {
+function uploadSingleFile(url: string, filePath: string, fileSize: number, timeoutMs: number): Promise<void> {
   return new Promise((resolve, reject) => {
     const parsedUrl = new URL(url);
     const options = {
@@ -320,21 +422,31 @@ function uploadSingleFile(url: string, filePath: string, fileSize: number): Prom
     };
 
     const proto = parsedUrl.protocol === "https:" ? require("https") : require("http");
+    const stream = fs.createReadStream(filePath);
+    let settled = false;
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      stream.destroy();
+      reject(error);
+    };
     const req = proto.request(options, (res: any) => {
       let body = "";
-      res.on("data", (chunk: string) => { body += chunk; });
+      res.on("data", (chunk: Buffer) => {
+        if (body.length < MAX_ERROR_BODY_BYTES) body += chunk.toString().slice(0, MAX_ERROR_BODY_BYTES - body.length);
+      });
       res.on("end", () => {
         if (res.statusCode !== 200) {
-          reject(new Error(`S3 upload failed: status ${res.statusCode} ${body}`));
+          fail(new UploadError(`S3 upload failed: status ${res.statusCode} ${body}`, isRetryableUploadStatus(res.statusCode || 0)));
           return;
         }
+        settled = true;
         resolve();
       });
     });
-
-    req.on("error", reject);
-
-    const stream = fs.createReadStream(filePath);
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`upload timed out after ${timeoutMs}ms`)));
+    req.on("error", (error: Error) => fail(new UploadError(error.message, true)));
+    stream.on("error", fail);
     stream.pipe(req);
   });
 }
@@ -345,18 +457,21 @@ async function parallelMap<T>(
   concurrency: number,
   fn: (item: T) => Promise<void>
 ): Promise<void> {
-  const executing: Set<Promise<void>> = new Set();
-
-  for (const item of items) {
-    const p = fn(item).then(() => {
-      executing.delete(p);
-    });
-    executing.add(p);
-
-    if (executing.size >= concurrency) {
-      await Promise.race(executing);
+  let nextIndex = 0;
+  let firstError: unknown;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (firstError === undefined) {
+      const index = nextIndex++;
+      if (index >= items.length) return;
+      try {
+        await fn(items[index]);
+      } catch (error) {
+        firstError = error;
+      }
     }
+  });
+  await Promise.all(workers);
+  if (firstError !== undefined) {
+    throw firstError;
   }
-
-  await Promise.all(executing);
 }
