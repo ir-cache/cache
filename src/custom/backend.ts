@@ -62,15 +62,19 @@ function getBaseUrl(): string {
 }
 
 export function getAuthHeaders(): Record<string, string> {
+  const repo = process.env.GITHUB_REPOSITORY;
+  if (!repo) {
+    throw new Error("GITHUB_REPOSITORY is not available for IR cache scoping");
+  }
+
+  const headers: Record<string, string> = {
+    "X-GitHub-Repository": repo,
+  };
   const token = process.env.GITHUB_TOKEN;
   if (token) {
-    return { Authorization: `Bearer ${token}` };
+    headers.Authorization = `Bearer ${token}`;
   }
-  const repo = process.env.GITHUB_REPOSITORY;
-  if (repo) {
-    return { "X-IR-Repository": repo };
-  }
-  throw new Error("No authentication available for IR cache");
+  return headers;
 }
 
 export function getCacheVersion(

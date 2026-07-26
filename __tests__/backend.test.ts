@@ -34,21 +34,23 @@ describe("backend", () => {
   describe("getAuthHeaders", () => {
     it("uses GITHUB_TOKEN when available", () => {
       process.env.GITHUB_TOKEN = "ghs_test123";
+      process.env.GITHUB_REPOSITORY = "acme/webapp";
       const headers = getAuthHeaders();
       expect(headers["Authorization"]).toBe("Bearer ghs_test123");
+      expect(headers["X-GitHub-Repository"]).toBe("acme/webapp");
     });
 
-    it("falls back to X-IR-Repository when no token", () => {
+    it("uses X-GitHub-Repository when no token", () => {
       delete process.env.GITHUB_TOKEN;
       process.env.GITHUB_REPOSITORY = "acme/webapp";
       const headers = getAuthHeaders();
-      expect(headers["X-IR-Repository"]).toBe("acme/webapp");
+      expect(headers["X-GitHub-Repository"]).toBe("acme/webapp");
     });
 
-    it("throws when neither token nor repo available", () => {
-      delete process.env.GITHUB_TOKEN;
+    it("throws when repository context is unavailable", () => {
+      process.env.GITHUB_TOKEN = "ghs_test123";
       delete process.env.GITHUB_REPOSITORY;
-      expect(() => getAuthHeaders()).toThrow("No authentication available");
+      expect(() => getAuthHeaders()).toThrow("GITHUB_REPOSITORY is not available");
     });
   });
 });

@@ -72,46 +72,44 @@ export async function saveImpl(
       core.info(`Cache saved with key: ${primaryKey}`);
     }
   } catch (error: unknown) {
-    utils.logWarning((error as Error).message);
+    throw error;
   }
   return cacheId;
 }
 
 export async function saveOnlyRun(earlyExit?: boolean): Promise<void> {
+  let failed = false;
   try {
     const cacheId = await saveImpl(new NullStateProvider());
     if (cacheId === -1) {
-      core.warning("Cache save failed.");
+      throw new Error("Cache save failed.");
     }
   } catch (err) {
-    console.error(err);
-    if (earlyExit) {
-      process.exit(1);
-    }
+    failed = true;
+    core.setFailed((err as Error).message);
   }
 
   renderMetricsSummary();
 
   if (earlyExit) {
-    process.exit(0);
+    process.exit(failed ? 1 : 0);
   }
 }
 
 export async function saveRun(earlyExit?: boolean): Promise<void> {
+  let failed = false;
   try {
     await saveImpl(new StateProvider());
   } catch (err) {
-    console.error(err);
-    if (earlyExit) {
-      process.exit(1);
-    }
+    failed = true;
+    core.setFailed((err as Error).message);
   }
 
   // Render build metrics to job summary (if collector ran)
   renderMetricsSummary();
 
   if (earlyExit) {
-    process.exit(0);
+    process.exit(failed ? 1 : 0);
   }
 }
 
