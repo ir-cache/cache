@@ -5,7 +5,8 @@ export declare enum Inputs {
     UploadChunkSize = "upload-chunk-size",
     EnableCrossOsArchive = "enableCrossOsArchive",
     FailOnCacheMiss = "fail-on-cache-miss",
-    LookupOnly = "lookup-only"
+    LookupOnly = "lookup-only",
+    Overwrite = "overwrite"
 }
 export declare enum Outputs {
     CacheHit = "cache-hit",

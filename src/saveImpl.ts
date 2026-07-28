@@ -52,24 +52,35 @@ export async function saveImpl(
 
     const cachePaths = utils.getInputAsArray(Inputs.Path, { required: true });
     const enableCrossOsArchive = utils.getInputAsBool(Inputs.EnableCrossOsArchive);
+    const allowOverwrite = utils.getInputAsBool(Inputs.Overwrite);
 
-    if (useIRCache) {
-      core.info("Using IR cache (S3-backed, via control plane)");
-      cacheId = await custom.saveCache(
-        cachePaths, primaryKey,
-        { uploadChunkSize: utils.getInputAsInt(Inputs.UploadChunkSize) },
-        enableCrossOsArchive
-      );
-    } else {
-      cacheId = await cache.saveCache(
-        cachePaths, primaryKey,
-        { uploadChunkSize: utils.getInputAsInt(Inputs.UploadChunkSize) },
-        enableCrossOsArchive
-      );
-    }
+    try {
+      if (useIRCache) {
+        core.info("Using IR cache (S3-backed, via control plane)");
+        cacheId = await custom.saveCache(
+          cachePaths, primaryKey,
+          { uploadChunkSize: utils.getInputAsInt(Inputs.UploadChunkSize) },
+          enableCrossOsArchive
+        );
+      } else {
+        cacheId = await cache.saveCache(
+          cachePaths, primaryKey,
+          { uploadChunkSize: utils.getInputAsInt(Inputs.UploadChunkSize) },
+          enableCrossOsArchive
+        );
+      }
 
-    if (cacheId !== -1) {
-      core.info(`Cache saved with key: ${primaryKey}`);
+      if (cacheId !== -1) {
+        core.info(`Cache saved with key: ${primaryKey}`);
+      }
+    } catch (error: unknown) {
+      const errorMessage = (error as Error).message;
+      // If cache already exists and overwrite is not enabled, treat as success
+      if (!allowOverwrite && errorMessage.includes("CacheContentConflict")) {
+        core.info(`Cache already exists for key: ${primaryKey}. Reusing existing cache.`);
+        return;
+      }
+      throw error;
     }
   } catch (error: unknown) {
     throw error;

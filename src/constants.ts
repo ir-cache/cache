@@ -6,6 +6,7 @@ export enum Inputs {
   EnableCrossOsArchive = "enableCrossOsArchive",
   FailOnCacheMiss = "fail-on-cache-miss",
   LookupOnly = "lookup-only",
+  Overwrite = "overwrite",
 }
 
 export enum Outputs {

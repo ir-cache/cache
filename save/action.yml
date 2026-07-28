@@ -15,6 +15,10 @@ inputs:
     description: 'Allow cross-OS cache save'
     default: 'false'
     required: false
+  overwrite:
+    description: 'When true, allows overwriting existing cache entry with different content. When false (default), reuses existing cache instead of returning a conflict error'
+    default: 'false'
+    required: false
 runs:
   using: 'node24'
   main: '../dist/save-only/index.js'
