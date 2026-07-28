@@ -21,6 +21,10 @@ interface CreateCacheEntryResponse {
   };
 }
 
+interface CheckCacheEntryResponse {
+  result: "miss" | "duplicate";
+}
+
 interface FinalizeCacheEntryResponse {
   ok: boolean;
   entryId: string;
@@ -183,10 +187,39 @@ export async function getCacheEntry(
   };
 }
 
+export async function checkCacheEntry(
+  key: string,
+  paths: string[],
+  contentSha256: string,
+  options: { compressionMethod?: string; enableCrossOsArchive?: boolean }
+): Promise<"miss" | "duplicate"> {
+  const baseUrl = getBaseUrl();
+  const version = getCacheVersion(paths, options.compressionMethod, options.enableCrossOsArchive);
+  const response = await httpClient.post(
+    `${baseUrl}${twirpPrefix}CheckCacheEntry`,
+    JSON.stringify({ key, version, contentSha256 }),
+    { ...getAuthHeaders(), "Content-Type": "application/json" }
+  );
+  const status = response.message.statusCode || 0;
+  const body = await response.readBody();
+  if (status === 409) {
+    throw new Error(`CacheContentConflict for key ${key}: ${body}`);
+  }
+  if (status !== 200) {
+    throw new Error(`CheckCacheEntry failed with status ${status}: ${body}`);
+  }
+  const result = JSON.parse(body) as CheckCacheEntryResponse;
+  if (result.result !== "miss" && result.result !== "duplicate") {
+    throw new Error(`CheckCacheEntry returned invalid result: ${body}`);
+  }
+  return result.result;
+}
+
 export async function saveCache(
   key: string,
   paths: string[],
   archivePath: string,
+  contentSha256: string,
   options: {
     compressionMethod?: string;
     enableCrossOsArchive?: boolean;
@@ -216,12 +249,16 @@ export async function saveCache(
     key,
     version,
     sizeBytes: String(fileSize),
+    contentSha256,
   });
 
   const createResponse = await httpClient.post(createUrl, createBody, createHeaders);
   const createStatus = createResponse.message.statusCode || 0;
   const createResponseBody = await createResponse.readBody();
 
+  if (createStatus === 409) {
+    throw new Error(`CacheContentConflict for key ${key}: ${createResponseBody}`);
+  }
   if (createStatus !== 200) {
     throw new Error(`CreateCacheEntry failed with status ${createStatus}: ${createResponseBody}`);
   }
@@ -256,7 +293,7 @@ export async function saveCache(
       });
 
       const finalizeUrl = `${baseUrl}${twirpPrefix}FinalizeCacheEntryUpload`;
-      const finalizeBody = JSON.stringify({ key, version, sizeBytes: String(fileSize), uploadId, parts: completedParts });
+      const finalizeBody = JSON.stringify({ key, version, sizeBytes: String(fileSize), contentSha256, uploadId, parts: completedParts });
       const finalizeResponse = await httpClient.post(finalizeUrl, finalizeBody, createHeaders);
       const finalizeStatus = finalizeResponse.message.statusCode || 0;
       if (finalizeStatus !== 200) {
@@ -270,7 +307,7 @@ export async function saveCache(
   } else if (createResult.signedUploadUrl) {
     // Single PUT upload using native http/https to handle both protocols
     await withUploadRetry("cache archive", settings.uploadMaxAttempts, () =>
-      uploadSingleFile(createResult.signedUploadUrl, archivePath, fileSize, settings.uploadTimeoutMs)
+      uploadSingleFile(createResult.signedUploadUrl, archivePath, fileSize, contentSha256, settings.uploadTimeoutMs)
     );
 
     core.info("Upload complete, finalizing...");
@@ -281,6 +318,7 @@ export async function saveCache(
       key,
       version,
       sizeBytes: String(fileSize),
+      contentSha256,
     });
 
     const finalizeResponse = await httpClient.post(finalizeUrl, finalizeBody, createHeaders);
@@ -407,7 +445,7 @@ function uploadPart(url: string, filePath: string, start: number, length: number
 }
 
 // uploadSingleFile uploads an entire file to a presigned URL using native http/https.
-function uploadSingleFile(url: string, filePath: string, fileSize: number, timeoutMs: number): Promise<void> {
+function uploadSingleFile(url: string, filePath: string, fileSize: number, contentSha256: string, timeoutMs: number): Promise<void> {
   return new Promise((resolve, reject) => {
     const parsedUrl = new URL(url);
     const options = {
@@ -418,6 +456,7 @@ function uploadSingleFile(url: string, filePath: string, fileSize: number, timeo
       headers: {
         "Content-Length": String(fileSize),
         "Content-Type": "application/octet-stream",
+        "x-amz-meta-content-sha256": contentSha256,
       },
     };
 

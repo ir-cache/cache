@@ -7,6 +7,7 @@ import {
   extractTar,
   listTar,
 } from "@actions/cache/lib/internal/tar";
+import { computeContentSHA256 } from "./contentDigest";
 
 export class ValidationError extends Error {
   constructor(message: string) {
@@ -139,6 +140,18 @@ export async function saveCache(
     );
   }
 
+  core.info("Calculating normalized cache content SHA-256...");
+  const contentSha256 = await computeContentSHA256(cachePaths);
+  core.info(`Cache content SHA-256: ${contentSha256}`);
+  const checkResult = await cacheHttpClient.checkCacheEntry(key, paths, contentSha256, {
+    compressionMethod,
+    enableCrossOsArchive,
+  });
+  if (checkResult === "duplicate") {
+    core.info("Identical cache entry already exists — skipping archive creation and upload");
+    return 1;
+  }
+
   const archiveFolder = await utils.createTempDirectory();
   const archivePath = path.join(
     archiveFolder,
@@ -157,7 +170,7 @@ export async function saveCache(
     const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
     core.debug(`File Size: ${archiveFileSize}`);
 
-    await cacheHttpClient.saveCache(key, paths, archivePath, {
+    await cacheHttpClient.saveCache(key, paths, archivePath, contentSha256, {
       compressionMethod,
       enableCrossOsArchive,
       chunkSize: options?.uploadChunkSize,

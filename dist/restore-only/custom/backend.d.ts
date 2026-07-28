@@ -28,7 +28,11 @@ export declare function getCacheEntry(keys: string[], paths: string[], options: 
     compressionMethod?: string;
     enableCrossOsArchive?: boolean;
 }): Promise<ArtifactCacheEntry | null>;
-export declare function saveCache(key: string, paths: string[], archivePath: string, options: {
+export declare function checkCacheEntry(key: string, paths: string[], contentSha256: string, options: {
+    compressionMethod?: string;
+    enableCrossOsArchive?: boolean;
+}): Promise<"miss" | "duplicate">;
+export declare function saveCache(key: string, paths: string[], archivePath: string, contentSha256: string, options: {
     compressionMethod?: string;
     enableCrossOsArchive?: boolean;
     chunkSize?: number;
